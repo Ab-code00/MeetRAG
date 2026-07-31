@@ -72,6 +72,10 @@ class Settings(BaseSettings):
 
     groq_api_key: str = ""
     groq_stt_model: str = "whisper-large-v3"
+    deepgram_api_key: str = "85765a7821760cb196b4bd527b7cee3b06ee1cfd"
+    deepgram_stt_model: str = "nova-3"
+    # auto | groq | deepgram — auto prefers Deepgram when DEEPGRAM_API_KEY is set
+    transcription_provider: str = "auto"
     openrouter_api_key: str = ""
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
     openrouter_llm_model: str = "OpenAI: gpt-oss-120b"
@@ -92,6 +96,25 @@ class Settings(BaseSettings):
     chunk_overlap_ratio: float = 0.15
     retrieval_top_k: int = 8
     retrieval_score_threshold: float = 0.10
+
+    @property
+    def stt_provider(self) -> str:
+        """Resolve the active STT provider (groq or deepgram)."""
+        if self.transcription_provider != "auto":
+            return self.transcription_provider
+        return "deepgram" if self.deepgram_api_key else "groq"
+
+    @property
+    def stt_model(self) -> str:
+        """Resolve the active STT model for the resolved provider."""
+        return self.deepgram_stt_model if self.stt_provider == "deepgram" else self.groq_stt_model
+
+    @field_validator("transcription_provider")
+    @classmethod
+    def validate_transcription_provider(cls, value: object) -> str:
+        if value not in ("auto", "groq", "deepgram"):
+            raise ValueError("TRANSCRIPTION_PROVIDER must be one of: auto, groq, deepgram")
+        return str(value)
 
     @field_validator("aws_endpoint_url", "aws_public_endpoint_url", "cookie_domain", mode="before")
     @classmethod

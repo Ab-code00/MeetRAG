@@ -60,7 +60,7 @@ def _run_async(coro):
     return _ASYNC_RUNNER.submit(asyncio.run, coro).result()
 
 STAGE_VERSION: dict[JobStage, Callable[..., str]] = {
-    JobStage.TRANSCRIBE: lambda: get_settings().groq_stt_model,
+    JobStage.TRANSCRIBE: lambda: get_settings().stt_model,
     JobStage.CLEAN: lambda: get_settings().cleaning_version,
     JobStage.CHUNK: lambda: get_settings().chunking_version,
     JobStage.EMBED_INDEX: lambda: get_settings().openrouter_embedding_model,
@@ -148,6 +148,7 @@ def run_clean(db: Session, meeting: Meeting) -> dict[str, Any]:
         select(TranscriptRaw).where(
             TranscriptRaw.meeting_id == meeting.id,
             TranscriptRaw.tenant_id == meeting.tenant_id,
+            TranscriptRaw.stt_model == settings.stt_model,
         )
     )
     if raw is None:
@@ -169,6 +170,7 @@ def run_chunk(db: Session, meeting: Meeting) -> dict[str, Any]:
         select(TranscriptRaw).where(
             TranscriptRaw.meeting_id == meeting.id,
             TranscriptRaw.tenant_id == meeting.tenant_id,
+            TranscriptRaw.stt_model == settings.stt_model,
         )
     )
     if raw is None:

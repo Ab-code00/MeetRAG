@@ -11,11 +11,12 @@ from botocore.client import Config
 from app.core.config import get_settings
 
 LOCAL_STORAGE_ROOT = Path("local_storage") / "recordings"
+_MAX_FILENAME_CHARS = 100
 
 
 def safe_filename(filename: str) -> str:
     cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", filename).strip(".-")
-    return cleaned[:180] or "recording"
+    return cleaned[:_MAX_FILENAME_CHARS].strip(".-") or "recording"
 
 
 def recording_object_key(tenant_id: str, meeting_id: str, recording_id: str, filename: str) -> str:
@@ -25,8 +26,33 @@ def recording_object_key(tenant_id: str, meeting_id: str, recording_id: str, fil
 # ── Local filesystem helpers (development fallback) ──
 
 def get_local_path(object_key: str) -> Path:
-    """Return the local filesystem path for a storage object key."""
+    """Return the local filesystem path for a storage object key.
+
+    Local development uses a flattened ``{recording_id}/{filename}`` layout
+    keyed on the unique recording UUID, keeping paths well under the Windows
+    MAX_PATH (260-char) limit that the legacy deep ``tenants/.../meetings/...``
+    nesting could exceed with long filenames.
+    """
+    parts = object_key.split("/")
+    if len(parts) >= 2 and parts[-1]:
+        return LOCAL_STORAGE_ROOT / parts[-2] / parts[-1]
+    return _legacy_local_path(object_key)
+
+
+def _legacy_local_path(object_key: str) -> Path:
+    """Legacy deep path used for recordings saved before the flattened layout."""
     return LOCAL_STORAGE_ROOT / object_key
+
+
+def _resolve_local_path(object_key: str) -> Path:
+    """Resolve a recording file, preferring the flattened path over the legacy one."""
+    path = get_local_path(object_key)
+    if path.exists():
+        return path
+    legacy = _legacy_local_path(object_key)
+    if legacy.exists():
+        return legacy
+    raise FileNotFoundError(f"Local recording not found: {object_key}")
 
 
 def save_file_locally(object_key: str, content: bytes) -> Path:
@@ -39,9 +65,7 @@ def save_file_locally(object_key: str, content: bytes) -> Path:
 
 def head_local_file(object_key: str) -> dict[str, Any]:
     """Return metadata for a locally stored file (mimics S3 head_object)."""
-    path = get_local_path(object_key)
-    if not path.exists():
-        raise FileNotFoundError(f"Local recording not found: {object_key}")
+    path = _resolve_local_path(object_key)
     return {
         "ContentLength": path.stat().st_size,
         "ContentType": "",
@@ -120,10 +144,7 @@ def head_recording(object_key: str) -> dict[str, Any]:
 def download_recording(object_key: str, destination: str) -> None:
     """Download a recording to a local path. Falls back to local filesystem if S3 is not configured."""
     if not _storage_available():
-        src = get_local_path(object_key)
-        if not src.exists():
-            raise FileNotFoundError(f"Local recording not found: {object_key}")
         import shutil
-        shutil.copy2(str(src), destination)
+        shutil.copy2(str(_resolve_local_path(object_key)), destination)
         return
     internal_s3_client().download_file(get_settings().aws_s3_bucket, object_key, destination)

@@ -12,6 +12,7 @@ dependencies = [
   "asyncmy>=0.2.10,<1",
   "boto3>=1.35,<2",
   "celery[redis]>=5.4,<6",
+  "deepgram-sdk>=3.11,<4",
   "email-validator>=2.2,<3",
   "fastapi>=0.115,<1",
   "groq>=0.18,<1",
@@ -67,5 +68,5 @@ warn_return_any = true
 warn_unused_ignores = true
 
 [[tool.mypy.overrides]]
-module = ["boto3.*", "botocore.*", "celery.*"]
+module = ["boto3.*", "botocore.*", "celery.*", "deepgram.*"]
 ignore_missing_imports = true

@@ -10,7 +10,7 @@ from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from redis.asyncio import Redis
 from sqlalchemy import text
 
-from app.api.routes import admin, auth, meetings, search
+from app.api.routes import admin, auth, chat, meetings, search
 from app.core.config import get_settings
 from app.core.logging import configure_logging
 from app.core.middleware import CorrelationMiddleware
@@ -47,7 +47,7 @@ app.add_middleware(
     allow_headers=["*"],
     expose_headers=["*"],
 )
-for route_group in (auth.router, meetings.router, search.router, admin.router):
+for route_group in (auth.router, meetings.router, search.router, chat.router, admin.router):
     app.include_router(route_group, prefix="/api/v1")
 
 

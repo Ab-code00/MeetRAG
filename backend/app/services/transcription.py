@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -7,6 +9,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
 
+from deepgram import DeepgramClient, PrerecordedOptions
 from groq import Groq
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -92,16 +95,186 @@ def _segment_drafts(payload: Mapping[str, Any], raw_text: str) -> list[SegmentDr
     ]
 
 
+# ── Deepgram helpers ──
+
+
+def _deepgram_payload(response: object) -> dict[str, Any]:
+    """Convert a Deepgram SDK response into a plain dict."""
+    if isinstance(response, Mapping):
+        return dict(response)
+    to_dict = getattr(response, "to_dict", None)
+    if callable(to_dict):
+        payload = to_dict()
+        if isinstance(payload, Mapping):
+            return dict(payload)
+    to_json = getattr(response, "to_json", None)
+    if callable(to_json):
+        try:
+            payload = json.loads(to_json())
+        except (TypeError, ValueError):
+            payload = None
+        if isinstance(payload, Mapping):
+            return dict(payload)
+    raise RuntimeError("Deepgram returned an unsupported transcription response")
+
+
+def _deepgram_alternative(payload: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    try:
+        channels = payload["results"]["channels"]
+    except (KeyError, TypeError):
+        return None
+    if not isinstance(channels, list) or not channels:
+        return None
+    channel = channels[0]
+    if not isinstance(channel, Mapping):
+        return None
+    alternatives = channel.get("alternatives")
+    if not isinstance(alternatives, list) or not alternatives:
+        return None
+    alternative = alternatives[0]
+    return alternative if isinstance(alternative, Mapping) else None
+
+
+def _deepgram_raw_text(payload: Mapping[str, Any]) -> str:
+    alternative = _deepgram_alternative(payload)
+    if alternative is None:
+        return ""
+    transcript = alternative.get("transcript")
+    return str(transcript) if transcript else ""
+
+
+def _deepgram_duration_ms(payload: Mapping[str, Any]) -> int:
+    try:
+        return _seconds_to_ms(payload["metadata"]["duration"])
+    except (KeyError, IndexError, TypeError):
+        return 0
+
+
+def _deepgram_detected_language(payload: Mapping[str, Any]) -> str | None:
+    try:
+        detected = payload["metadata"]["detected_language"]
+    except (KeyError, IndexError, TypeError):
+        return None
+    return str(detected) if detected else None
+
+
+def _deepgram_drafts(payload: Mapping[str, Any], raw_text: str) -> list[SegmentDraft]:
+    """Map Deepgram diarized utterances into segment drafts with speaker labels."""
+    drafts: list[SegmentDraft] = []
+    alternative = _deepgram_alternative(payload)
+    if alternative is not None:
+        utterances = alternative.get("utterances")
+        if isinstance(utterances, list):
+            for item in utterances:
+                if not isinstance(item, Mapping):
+                    continue
+                provider_data = dict(item)
+                text = str(provider_data.get("transcript") or "")
+                if not text.strip():
+                    continue
+                start_ms = _seconds_to_ms(provider_data.get("start"))
+                end_ms = max(start_ms, _seconds_to_ms(provider_data.get("end")))
+                speaker_value = provider_data.get("speaker")
+                drafts.append(
+                    SegmentDraft(
+                        start_ms=start_ms,
+                        end_ms=end_ms,
+                        speaker=f"Speaker {speaker_value}" if speaker_value is not None else None,
+                        text=text,
+                        confidence=_optional_float(provider_data.get("confidence")),
+                        provider_data=provider_data,
+                    )
+                )
+    if drafts:
+        return drafts
+
+    # Fallback: reconstruct segments from word-level speaker labels
+    # (Deepgram may return per-word speakers even when utterances are absent).
+    drafts = _deepgram_word_drafts(payload)
+    if drafts:
+        return drafts
+
+    # Last-resort fallback: whole transcript as a single unlabeled segment
+    return [
+        SegmentDraft(
+            start_ms=0,
+            end_ms=_deepgram_duration_ms(payload),
+            speaker=None,
+            text=raw_text,
+            confidence=None,
+            provider_data={},
+        )
+    ]
+
+
+def _deepgram_word_drafts(payload: Mapping[str, Any]) -> list[SegmentDraft]:
+    """Group consecutive word-level tokens by speaker into segment drafts."""
+    alternative = _deepgram_alternative(payload)
+    if alternative is None:
+        return []
+    words = alternative.get("words")
+    if not isinstance(words, list) or not words:
+        return []
+
+    drafts: list[SegmentDraft] = []
+    current: list[Mapping[str, Any]] = []
+    current_speaker: object = None
+
+    def flush() -> None:
+        nonlocal current
+        if not current:
+            return
+        speaker_value = current[0].get("speaker")
+        text = " ".join(str(item.get("word") or "") for item in current)
+        text = re.sub(r"\s{2,}", " ", text)
+        text = re.sub(r"\s+([,.;:?!])", r"\1", text).strip()
+        confidence_values = [
+            value
+            for item in current
+            if (value := _optional_float(item.get("confidence"))) is not None
+        ]
+        drafts.append(
+            SegmentDraft(
+                start_ms=_seconds_to_ms(current[0].get("start")),
+                end_ms=_seconds_to_ms(current[-1].get("end")),
+                speaker=f"Speaker {speaker_value}" if speaker_value is not None else None,
+                text=text,
+                confidence=sum(confidence_values, 0.0) / len(confidence_values) if confidence_values else None,
+                provider_data={"speaker": speaker_value, "word_count": len(current)},
+            )
+        )
+        current = []
+
+    for word in words:
+        if not isinstance(word, Mapping):
+            continue
+        if current and word.get("speaker") != current_speaker:
+            flush()
+        current.append(word)
+        current_speaker = word.get("speaker")
+    flush()
+    return drafts
+
+
+# ── Main entry point ──
+
+
 def transcribe_recording(db: Session, meeting: Meeting) -> dict[str, Any]:
     settings = get_settings()
-    if not settings.groq_api_key:
-        raise RuntimeError("GROQ_API_KEY is not configured")
+    provider = settings.stt_provider
+    stt_model = settings.stt_model
+    if provider == "deepgram":
+        if not settings.deepgram_api_key:
+            raise RuntimeError("DEEPGRAM_API_KEY is not configured")
+    else:
+        if not settings.groq_api_key:
+            raise RuntimeError("GROQ_API_KEY is not configured")
 
     existing = db.scalar(
         select(TranscriptRaw).where(
             TranscriptRaw.meeting_id == meeting.id,
             TranscriptRaw.tenant_id == meeting.tenant_id,
-            TranscriptRaw.stt_model == settings.groq_stt_model,
+            TranscriptRaw.stt_model == stt_model,
         )
     )
     if existing is not None:
@@ -116,7 +289,8 @@ def transcribe_recording(db: Session, meeting: Meeting) -> dict[str, Any]:
             "transcript_id": existing.id,
             "segment_count": segment_count or 0,
             "duration_ms": existing.duration_ms,
-            "stt_model": existing.stt_model,
+            "stt_model": stt_model,
+            "stt_provider": provider,
             "reused": True,
         }
 
@@ -140,30 +314,55 @@ def transcribe_recording(db: Session, meeting: Meeting) -> dict[str, Any]:
         if not local_path.exists():
             raise RuntimeError(f"Recording file not found: {recording.object_key}")
         with local_path.open("rb") as audio_file:
-            response = Groq(api_key=settings.groq_api_key).audio.transcriptions.create(
-                model=settings.groq_stt_model,
-                file=(recording.original_filename, audio_file, recording.content_type),
-                response_format="verbose_json",
-                timestamp_granularities=["segment"],
-                temperature=0,
-            )
+            if provider == "deepgram":
+                client = DeepgramClient(settings.deepgram_api_key)
+                options = PrerecordedOptions(
+                    model=settings.deepgram_stt_model,
+                    diarize=True,
+                    utterances=True,
+                    utt_split=1.5,
+                )
+                response = client.listen.prerecorded.v("1").transcribe_file(
+                    source={"stream": audio_file}, options=options
+                )
+                payload = _deepgram_payload(response)
+                raw_text = _deepgram_raw_text(payload)
+                drafts = _deepgram_drafts(payload, raw_text)
+            else:
+                response = Groq(api_key=settings.groq_api_key).audio.transcriptions.create(
+                    model=settings.groq_stt_model,
+                    file=(recording.original_filename, audio_file, recording.content_type),
+                    response_format="verbose_json",
+                    timestamp_granularities=["segment"],
+                    temperature=0,
+                )
+                payload = _response_payload(response)
+                raw_text = str(payload.get("text") or "")
+                drafts = _segment_drafts(payload, raw_text)
 
-    payload = _response_payload(response)
-    raw_text = str(payload.get("text") or "")
+    if not raw_text.strip() and drafts:
+        raw_text = "\n".join(draft.text for draft in drafts)
     if not raw_text.strip():
-        raise RuntimeError("Groq returned an empty transcript")
-    drafts = _segment_drafts(payload, raw_text)
-    duration_ms = _seconds_to_ms(payload.get("duration"))
+        raise RuntimeError(f"{provider.title()} returned an empty transcript")
+
+    if provider == "deepgram":
+        duration_ms = _deepgram_duration_ms(payload)
+    else:
+        duration_ms = _seconds_to_ms(payload.get("duration"))
     if duration_ms == 0:
         duration_ms = max((draft.end_ms for draft in drafts), default=0)
-    language_value = payload.get("language")
+
+    if provider == "deepgram":
+        language_value = _deepgram_detected_language(payload)
+    else:
+        language_value = payload.get("language")
     now = datetime.now(UTC)
     transcript = TranscriptRaw(
         tenant_id=meeting.tenant_id,
         meeting_id=meeting.id,
         recording_id=recording.id,
-        stt_provider="groq",
-        stt_model=settings.groq_stt_model,
+        stt_provider=provider,
+        stt_model=stt_model,
         language=str(language_value) if language_value else None,
         raw_text=raw_text,
         provider_response=payload,
@@ -193,6 +392,7 @@ def transcribe_recording(db: Session, meeting: Meeting) -> dict[str, Any]:
         "transcript_id": transcript.id,
         "segment_count": len(drafts),
         "duration_ms": duration_ms,
-        "stt_model": settings.groq_stt_model,
+        "stt_model": stt_model,
+        "stt_provider": provider,
         "reused": False,
     }

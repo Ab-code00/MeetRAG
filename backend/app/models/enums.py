@@ -45,3 +45,8 @@ class RecordingStatus(StrEnum):
     FAILED = "FAILED"
     DELETED = "DELETED"
 
+
+class ChatRole(StrEnum):
+    USER = "USER"
+    ASSISTANT = "ASSISTANT"
+

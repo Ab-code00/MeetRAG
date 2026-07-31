@@ -24,7 +24,14 @@ from sqlalchemy.dialects.mysql import BINARY as MySQLBinary
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
-from app.models.enums import JobStage, JobStatus, MeetingStatus, RecordingStatus, UserRole
+from app.models.enums import (
+    ChatRole,
+    JobStage,
+    JobStatus,
+    MeetingStatus,
+    RecordingStatus,
+    UserRole,
+)
 
 
 class Tenant(UUIDPrimaryKeyMixin, TimestampMixin, Base):
@@ -266,6 +273,45 @@ class AnswerGeneration(UUIDPrimaryKeyMixin, Base):
     estimated_cost_usd: Mapped[float | None] = mapped_column(Float)
     latency_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
     correlation_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class ChatSession(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    __tablename__ = "chat_sessions"
+    __table_args__ = (
+        Index("ix_chat_sessions_tenant_meeting", "tenant_id", "meeting_id"),
+        Index("ix_chat_sessions_tenant_user", "tenant_id", "user_id"),
+    )
+
+    tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id"), nullable=False, index=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), nullable=False)
+    meeting_id: Mapped[str] = mapped_column(ForeignKey("meetings.id"), nullable=False)
+    title: Mapped[str | None] = mapped_column(String(300))
+    # Per-session message ordinal counter. Updated atomically under a
+    # SELECT ... FOR UPDATE on this row so concurrent asks can't collide on
+    # the (session_id, ordinal) unique constraint (MAX(ordinal)+1 is a
+    # REPEATABLE-READ snapshot read and can return stale values).
+    last_message_ordinal: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class ChatMessage(UUIDPrimaryKeyMixin, Base):
+    __tablename__ = "chat_messages"
+    __table_args__ = (
+        UniqueConstraint("session_id", "ordinal", name="uq_chat_message_session_ordinal"),
+        Index("ix_chat_messages_session_created", "session_id", "created_at"),
+        Index("ix_chat_messages_tenant_created", "tenant_id", "created_at"),
+    )
+
+    tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id"), nullable=False, index=True)
+    session_id: Mapped[str] = mapped_column(ForeignKey("chat_sessions.id"), nullable=False)
+    ordinal: Mapped[int] = mapped_column(Integer, nullable=False)
+    role: Mapped[ChatRole] = mapped_column(Enum(ChatRole), nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    citations_json: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON)
+    evidence_sufficient: Mapped[bool | None] = mapped_column(Boolean)
+    search_query_id: Mapped[str | None] = mapped_column(ForeignKey("search_queries.id"))
+    answer_generation_id: Mapped[str | None] = mapped_column(ForeignKey("answer_generations.id"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 

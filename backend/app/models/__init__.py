@@ -1,6 +1,8 @@
 from app.models.entities import (
     AnswerGeneration,
     AuditLog,
+    ChatMessage,
+    ChatSession,
     Meeting,
     ProcessingJob,
     QdrantDocument,
@@ -18,6 +20,8 @@ from app.models.entities import (
 __all__ = [
     "AnswerGeneration",
     "AuditLog",
+    "ChatMessage",
+    "ChatSession",
     "Meeting",
     "ProcessingJob",
     "QdrantDocument",

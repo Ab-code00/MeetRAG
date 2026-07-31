@@ -1,6 +1,8 @@
+import json
 import time
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 
@@ -17,6 +19,13 @@ class CompletionResult:
     input_tokens: int | None
     output_tokens: int | None
     latency_ms: int
+
+
+# Events emitted by :func:`grounded_completion_stream`: a ``("delta", text)``
+# event per token chunk, then a final ``("result", CompletionResult)`` event.
+CompletionStreamEvent = (
+    tuple[Literal["delta"], str] | tuple[Literal["result"], CompletionResult]
+)
 
 
 def _headers() -> dict[str, str]:
@@ -87,5 +96,70 @@ async def grounded_completion(*, system_prompt: str, user_prompt: str) -> Comple
         input_tokens=usage.get("prompt_tokens"),
         output_tokens=usage.get("completion_tokens"),
         latency_ms=round((time.perf_counter() - started) * 1000),
+    )
+
+
+async def grounded_completion_stream(
+    *, system_prompt: str, user_prompt: str
+) -> AsyncIterator[CompletionStreamEvent]:
+    """
+    Stream a grounded completion from OpenRouter (SSE over HTTP).
+
+    Yields ``("delta", text)`` events as token chunks arrive and a final
+    ``("result", CompletionResult)`` once the stream ends. Token usage is read
+    from the provider's per-chunk ``usage`` field when present (OpenRouter
+    sends it on the last chunk for most models) and falls back to ``None``.
+    """
+    settings = get_settings()
+    started = time.perf_counter()
+    usage: dict[str, Any] = {}
+    text_parts: list[str] = []
+    async with httpx.AsyncClient(timeout=180) as client:
+        async with client.stream(
+            "POST",
+            f"{settings.openrouter_base_url.rstrip('/')}/chat/completions",
+            headers=_headers(),
+            json={
+                "model": settings.openrouter_llm_model,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "temperature": 0.1,
+                "stream": True,
+            },
+        ) as response:
+            if response.is_error:
+                body = (await response.aread()).decode("utf-8", errors="replace")
+                raise ModelProviderError(
+                    f"Answer request failed ({response.status_code}): {body[:500]}"
+                )
+            async for line in response.aiter_lines():
+                if not line.startswith("data:"):
+                    continue
+                payload = line[len("data:") :].strip()
+                if payload == "[DONE]":
+                    break
+                try:
+                    chunk: dict[str, Any] = json.loads(payload)
+                except json.JSONDecodeError:
+                    continue
+                if chunk.get("usage"):
+                    usage = chunk["usage"]
+                try:
+                    delta = chunk["choices"][0]["delta"]["content"]
+                except (KeyError, IndexError, TypeError):
+                    continue
+                if delta:
+                    text_parts.append(delta)
+                    yield ("delta", delta)
+    yield (
+        "result",
+        CompletionResult(
+            text="".join(text_parts).strip(),
+            input_tokens=usage.get("prompt_tokens"),
+            output_tokens=usage.get("completion_tokens"),
+            latency_ms=round((time.perf_counter() - started) * 1000),
+        ),
     )
 
