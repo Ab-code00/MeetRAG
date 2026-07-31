@@ -1,0 +1,946 @@
+# MeetAI Local Development Analysis & Recommendations
+
+## SUMMARY OF ISSUES FOUND
+
+After comprehensively analyzing the MeetAI codebase, here are the key findings for local development without Docker services:
+
+### 1. **Vector Store Configuration**
+   - **PROBLEM**: The code currently imports `qdrant_client` from `app.services.vector_store`, but this client is created without async support in some places. In local dev, you need local Qdrant.
+   - **SOLUTION**: For local development (no Docker), replace Qdrant with a simple in-memory SQLite vector store or do-nothing stub that returns empty results.
+
+### 2. **Celery & Redis Dependency**
+   - **PROBLEM**: The pipeline serialization depends entirely on Celery. In local dev without Redis, the transcription won't actually trigger.
+   - **SOLUTION**: For local dev, either:
+     - Option A: Run Redis locally (`docker run -p 6379:6379 redis:7.4-alpine`)
+     - Option B: Add direct execution paths in tests that call worker functions directly
+
+### 3. **OpenRouter Model Configuration**
+   - **PROBLEM**: The code hardcodes `openrouter_embedding_model: "sentence-transformers/all-minilm-l6-v2"` which might not exist on OpenRouter.
+   - **SOLUTION**: Verify the embedding model exists on OpenRouter, or use a reliable one.
+
+### 4. **Transcription API Key**
+   - **PROBLEM**: The code requires `GROQ_API_KEY` but it's not in `.env` by default.
+   - **SOLUTION**: Add your Groq API key to `.env`.
+
+### 5. **Model Versioning Confusion**
+   - **PROBLEM**: The STAGE_VERSION config stores transcription (Groq), cleaning version, chunking version, and embedding version. In local dev without full pipeline, this is complex.
+   - **SOLUTION**: Local dev should skip the full pipeline until work is done; use direct function calls instead.
+
+### 6. **S3 Configuration**
+   - **PROBLEM**: Uses LocalStack for local dev but can't test transcription without S3.
+   - **SOLUTION**: For local transcription testing, directly pass temp files instead of streaming from S3.
+
+---
+
+## RECOMMENDED LOCAL DEVELOPMENT SETUP
+
+### Step 1: Install Dependencies
+
+```bash
+cd backend
+python -m pip install -e ".[dev]"
+cd ..
+```
+
+### Step 2: Set Up Environment
+
+Create a `.env` file:
+
+```bash
+# Database
+DATABASE_URL=mysql+asyncmy://user:password@localhost:3307/meetai
+DATABASE_URL_SYNC=mysql+pymysql://user:password@localhost:3307/meetai
+
+# Redis (Either run container or comment out celery config)
+REDIS_URL=redis://localhost:6379/0
+CELERY_BROKER_URL=redis://localhost:6379/1
+CELERY_RESULT_BACKEND=redis://localhost:6379/2
+
+# External APIs
+GROQ_API_KEY=your_groq_api_key_here  # Required for transcription
+OPENROUTER_API_KEY=your_openrouter_api_key_here  # Required for embeddings and answers
+
+# AWS (For local dev, can use minimal config)
+AWS_ACCESS_KEY_ID=test
+AWS_SECRET_ACCESS_KEY=test  # LocalStack-only default
+AWS_REGION=us-east-1
+AWS_S3_BUCKET=meetai-recordings
+AWS_ENDPOINT_URL=http://localhost:4566  # Comment out for production
+AWS_PUBLIC_ENDPOINT_URL=http://localhost:4566  # Comment out for production
+
+# Qdrant - For local dev (comment out to skip vector search)
+QDRANT_URL=http://localhost:6333
+QDRANT_API_KEY=
+QDRANT_COLLECTION=meeting_chunks
+EMBEDDING_DIMENSION=384
+
+# Models
+GROQ_STT_MODEL=whisper-large-v3
+OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
+OPENROUTER_LLM_MODEL=openai/gpt-oss 120b:free
+OPENROUTER_EMBEDDING_MODEL=sentence-transformers/all-minilm-l6-v2
+OPENROUTER_APP_URL=http://localhost:3000
+OPENROUTER_APP_NAME=MeetAI
+
+# Settings
+APP_ENV=development
+APP_NAME=MeetAI
+APP_BASE_URL=http://localhost:8000
+FRONTEND_URL=http://localhost:3000
+LOG_LEVEL=INFO
+SECRET_KEY=your-32-char-secret-key-change-in-production
+ACCESS_TOKEN_TTL_MINUTES=15
+REFRESH_TOKEN_TTL_DAYS=30
+REFRESH_COOKIE_NAME=meetai_refresh
+COOKIE_DOMAIN=
+ALLOW_PUBLIC_SIGNUP=true
+
+# Processing settings
+CLEANING_VERSION=clean-v1
+CHUNKING_VERSION=speaker-semantic-v1
+ANSWER_PROMPT_VERSION=grounded-v1
+CHUNK_TARGET_TOKENS=700
+CHUNK_MAX_TOKENS=900
+CHUNK_OVERLAP_RATIO=0.15
+RETRIEVAL_TOP_K=8
+RETRIEVAL_SCORE_THRESHOLD=0.3
+```
+
+### Step 3: Start Minimal Services
+
+For local dev without Docker, you need:
+1. MySQL server
+2. Redis (optional if you want to test the full pipeline)
+3. Qdrant (optional for vector search)
+
+**Option A: Docker (Easiest)**
+
+```bash
+# Start just MySQL and Redis
+docker-compose up -d mysql redis
+
+# Then run the API with direct pipeline execution
+cd backend
+uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+**Option B: Without Docker**
+
+1. Install and start MySQL locally
+2. Install and start Redis locally (`redis-server`)
+3. Run the API
+
+### Step 4: Start Services
+
+**Terminal 1** - Start Redis (for Celery):
+
+```bash
+redis-server
+```
+
+**Terminal 2** - Start Celery worker:
+
+```bash
+cd backend
+celery -A app.workers.celery_app:celery_app worker \
+  --loglevel=INFO \
+  --queues=pipeline,dead_letter \
+  --without-gossip \
+  --without-mingle \
+  --without-heartbeat
+```
+
+**Terminal 3** - Start FastAPI:
+
+```bash
+cd backend
+uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+### Step 5: Run Tests
+
+```bash
+cd backend
+pytest
+```
+
+---
+
+## TESTING PIPELINE WITHOUT CELERY
+
+For local development without Celery, you can test individual stages:
+
+### Test Transcription Directory
+
+Since `transcription.py` currently tries to download from S3, modify for local testing:
+
+1. Create a test file at `backend/tests/conftest.py`:
+```python
+import tempfile
+from pathlib import Path
+from groq import Groq
+from sqlalchemy import select
+from app.db.sync_session import SyncSessionLocal
+from app.models import Meeting, Recording, TranscriptRaw
+from app.services.transcription import transcribe_recording
+from app.core.config import get_settings
+
+def test_local_transcribe():
+    """Test transcription without Celery or S3"""
+    settings = get_settings()
+    if not settings.groq_api_key:
+        print("Skipping: GROQ_API_KEY not configured")
+        return
+
+    # Create a test meeting and recording in DB
+    with SyncSessionLocal() as db:
+        meeting = Meeting(
+            tenant_id="test-tenant-id",
+            title="Test Meeting",
+            source="LOCAL_TEST"
+        )
+        db.add(meeting)
+        db.flush()
+
+        # For testing without actual S3, just create a mock recording
+        recording = Recording(
+            tenant_id="test-tenant-id",
+            meeting_id=meeting.id,
+            bucket="test-bucket",
+            object_key="test.mp4",
+            original_filename="test.mp4",
+            content_type="video/mp4",
+            status="UPLOADED"
+        )
+        db.add(recording)
+        db.flush()
+
+        # Temporarily mock S3 download to use a temp file instead
+        # You'd need to modify this to read from local file
+        result = transcribe_recording(db, meeting)
+        print(f"Transcription result: {result}")
+
+        # Clean up
+        meeting.deleted_at = datetime.utcnow()
+        db.commit()
+```
+
+### Simplified Local API Without Celery
+
+Create a local test script (`backend/test_local_api.py`):
+
+```python
+#!/usr/bin/env python
+"""
+Local development script that runs API directly without Celery.
+Tests each stage manually without going through the queue.
+"""
+import asyncio
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from typing import Any
+
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from app.core.config import get_settings
+from app.db.sync_session import SyncSessionLocal
+from app.models import (
+    Meeting,
+    Recording,
+    TranscriptRaw,
+    TranscriptSegmentRaw,
+)
+from app.models.enums import MeetingStatus
+from app.services.transcription import transcribe_recording
+from app.services.cleaner import clean_transcript_text
+from app.services.chunker import chunk_segments, SourceSegment
+from app.services.openrouter import embed_texts
+
+settings = get_settings()
+
+
+@dataclass
+class SimpleTestResult:
+    step: str
+    status: str
+    data: Any | None
+    error: str | None
+
+
+async def test_full_pipeline_locally():
+    """Run the full pipeline without Celery"""
+    print("\n=== Starting Local Pipeline Test ===\n")
+
+    results: list[SimpleTestResult] = []
+
+    # Step 1: Create test meeting
+    with SyncSessionLocal() as db:
+        meeting = Meeting(
+            tenant_id="local-test-tenant",
+            title="Local Pipeline Test Meeting",
+            meeting_date=datetime.now(UTC).date(),
+            project="Test Project",
+            department="Engineering",
+            status=MeetingStatus.PENDING,
+        )
+        db.add(meeting)
+        db.flush()
+
+        recording = Recording(
+            tenant_id="local-test-tenant",
+            meeting_id=meeting.id,
+            bucket="test-bucket",
+            object_key="test.mp3",
+            original_filename="test.mp3",
+            content_type="audio/mpeg",
+            status=MeetingStatus.PENDING,
+        )
+        db.add(recording)
+        db.flush()
+
+        print(f"1. Created test meeting: {meeting.id}")
+        results.append(SimpleTestResult(
+            step="1. Test meeting creation",
+            status="success",
+            data={"meeting_id": meeting.id, "recording_id": recording.id},
+            error=None
+        ))
+        db.commit()
+
+    # Step 2: Transcribe (this is where we mock since we don't have actual audio)
+    print("\n2. Testing transcription...")
+    if not settings.groq_api_key:
+        results.append(SimpleTestResult(
+            step="2. Transcription",
+            status="skipped",
+            data=None,
+            error="GROQ_API_KEY not configured. Skipping transcription."
+        ))
+    else:
+        try:
+            with SyncSessionLocal() as db:
+                meeting_data = db.get(Meeting, meeting.id)
+                result = transcribe_recording(db, meeting_data)
+                results.append(SimpleTestResult(
+                    step="2. Transcription",
+                    status="success",
+                    data=result,
+                    error=None
+                ))
+
+                # Check what we got
+                raw = db.scalar(
+                    select(TranscriptRaw).where(
+                        TranscriptRaw.meeting_id == meeting.id,
+                        TranscriptRaw.tenant_id == "local-test-tenant"
+                    )
+                )
+                print(f"   Raw text length: {len(raw.raw_text) if raw else 0}")
+                print(f"   Segment count: {len(result.get('segment_count', 0))}")
+
+                db.commit()
+        except Exception as e:
+            results.append(SimpleTestResult(
+                step="2. Transcription",
+                status="error",
+                data=None,
+                error=str(e)
+            ))
+
+    # Step 3: Clean transcript
+    print("\n3. Testing transcript cleaning...")
+    try:
+        with SyncSessionLocal() as db:
+            raw = db.scalar(
+                select(TranscriptRaw).where(
+                    TranscriptRaw.meeting_id == meeting.id,
+                    TranscriptRaw.tenant_id == "local-test-tenant"
+                )
+            )
+            if raw:
+                original = raw.raw_text
+                cleaned = clean_transcript_text(original)
+                results.append(SimpleTestResult(
+                    step="3. Transcript cleaning",
+                    status="success",
+                    data={"original_length": len(original), "cleaned_length": len(cleaned)},
+                    error=None
+                ))
+                print(f"   Original: {original[:100]}...")
+                print(f"   Cleaned: {cleaned[:100]}...")
+            db.commit()
+    except Exception as e:
+        results.append(SimpleTestResult(
+            step="3. Transcript cleaning",
+            status="error",
+            data=None,
+            error=str(e)
+        ))
+
+    # Step 4: Chunk transcript (mock data for local testing)
+    print("\n4. Testing chunking with mock data...")
+    try:
+        # Create mock segments for local testing
+        mock_segments = [
+            SourceSegment(
+                id="1",
+                start_ms=1000,
+                end_ms=5000,
+                speaker="Alice",
+                text="This is a test segment for the chunker. It should be processed correctly."
+            ),
+            SourceSegment(
+                id="2",
+                start_ms=5000,
+                end_ms=10000,
+                speaker="Bob",
+                text="I agree with Alice. We should test this thoroughly."
+            ),
+            SourceSegment(
+                id="3",
+                start_ms=10000,
+                end_ms=15000,
+                speaker="Charlie",
+                text="The parameters need to be set correctly for successful chunking."
+            ),
+        ]
+
+        drafts = chunk_segments(mock_segments)
+        results.append(SimpleTestResult(
+            step="4. Chunking",
+            status="success",
+            data={"segment_count": len(mock_segments), "chunk_count": len(drafts)},
+            error=None
+        ))
+        print(f"   Created {len(drafts)} chunks from {len(mock_segments)} segments")
+
+        for i, draft in enumerate(drafts[:2]):  # Show first 2 chunks
+            print(f"\n   Chunk {i+1}:")
+            print(f"   - Speakers: {', '.join(draft.speakers)}")
+            print(f"   - Start-End: {draft.start_ms}-{draft.end_ms}")
+            print(f"   - Tokens: ~{len(draft.source_text.split())}")
+    except Exception as e:
+        results.append(SimpleTestResult(
+            step="4. Chunking",
+            status="error",
+            data=None,
+            error=str(e)
+        ))
+
+    # Step 5: Test embeddings
+    print("\n5. Testing embeddings...")
+    if not settings.openrouter_api_key:
+        results.append(SimpleTestResult(
+            step="5. Embeddings",
+            status="skipped",
+            data=None,
+            error="OPENROUTER_API_KEY not configured. Skipping embeddings."
+        ))
+    else:
+        try:
+            test_texts = [
+                "This is a test text for embedding.",
+                "We are testing the embedding service."
+            ]
+            vectors = await embed_texts(test_texts)
+            results.append(SimpleTestResult(
+                step="5. Embeddings",
+                status="success",
+                data={"vector_length": len(vectors[0]) if vectors else 0, "count": len(vectors)},
+                error=None
+            ))
+            print(f"   Generated {len(vectors)} vectors with dimension {len(vectors[0])}")
+        except Exception as e:
+            results.append(SimpleTestResult(
+                step="5. Embeddings",
+                status="error",
+                data=None,
+                error=str(e)
+            ))
+
+    # Summary
+    print("\n=== Test Results Summary ===")
+    successful = sum(1 for r in results if r.status == "success")
+    errors = sum(1 for r in results if r.status == "error")
+    skipped = sum(1 for r in results if r.status == "skipped")
+
+    for result in results:
+        status_image = {
+            "success": "✓",
+            "error": "✗",
+            "skipped": "-"
+        }[result.status]
+        print(f"{status_image} {result.step}")
+        if result.data:
+            print(f"   Data: {result.data}")
+        if result.error:
+            print(f"   Error: {result.error}")
+
+    print(f"\nTotal: {len(results)} steps | "
+          f"✓ Success: {successful} | "
+          f"✗ Errors: {errors} | "
+          f"- Skipped: {skipped}")
+
+    return results
+
+
+if __name__ == "__main__":
+    asyncio.run(test_full_pipeline_locally())
+```
+
+Run it:
+```bash
+cd backend
+python -m pytest test_local_api.py
+```
+
+---
+
+## VECTOR STORE SOLUTIONS
+
+### Option A: Replace with FAISS (Local)
+
+Install: `pip install faiss-cpu`
+```python
+# Create backend/app/services/local_vector_store.py
+import faiss
+from typing import Any
+import numpy as np
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+from app.models import QdrantDocument
+from app.core.config import get_settings
+
+class LocalVectorStore:
+    """In-memory vector store using FAISS for local development"""
+
+    def __init__(self):
+        self.store: dict[str, list] = {}  # {point_id: {"vector": [f1,f2...], "payload": {...}}}
+        # categorical
+        self.index = faiss.IndexFlatIP(384)  # Matches OPENROUTER_EMBEDDING_MODEL
+
+    async def ensure_collection(self):
+        # Nothing needed for local
+        pass
+
+    async def upsert_points(self, points: list):
+        """In-memory vector store - does nothing for prod but works for dev"""
+        pass  # In real app, this would persist to database
+
+    async def deactivate_meeting_points(self, tenant_id: str, meeting_id: str):
+        for point_id, data in self.store.items():
+            if data["payload"].get("tenant_id") == tenant_id:
+                data["payload"]["is_active"] = False
+
+    async def search_points(self, *, tenant_id: str, vector: list, filters: dict, limit: int, score_threshold: float):
+        """Search in memory for testing"""
+        # Convert vector to numpy array
+        vec_array = np.array([vector], dtype='float32')
+        scores, indices = self.index.search(vec_array, limit)
+
+        results = []
+        for score, idx in zip(scores[0], indices[0]):
+            if score >= score_threshold:
+                point_id = [k for k, v in self.store.items() if v["payload"]["point_id"] == idx][0]
+                results.append({
+                    "id": point_id,
+                    "score": float(score),
+                    "payload": self.store[point_id]["payload"]
+                })
+
+        return results
+
+# Use this instead of vector_store for local dev
+```
+
+### Option B: Do Nothing Stub
+
+```python
+# backend/app/services/vector_store_stub.py
+"""Stub vector store that does nothing for local development"""
+
+class StubVectorStore:
+    """No-op vector store for development without Qdrant"""
+
+    @staticmethod
+    async def ensure_collection():
+        """No-op"""
+        return
+
+    @staticmethod
+    async def upsert_points(points):
+        """No-op - assumes data persists in MySQL"""
+        return
+
+    @staticmethod
+    async def deactivate_meeting_points(tenant_id: str, meeting_id: str):
+        """No-op"""
+        return
+
+    @staticmethod
+    async def search_points(*, tenant_id: str, vector: list, filters: dict, limit: int, score_threshold: float):
+        """Return empty results - no vector search in local dev"""
+        return []
+```
+
+Then update `backend/app/services/vector_store.py` to use stub for local dev:
+
+```python
+# Add detection at top of file
+
+import os
+from app.core.config import get_settings
+
+# Use stub for local dev if QDRANT_URL is localhost and not configured
+settings = get_settings()
+if settings.qdrant_url.startswith("http://localhost") and not settings.get("USE_QDRANT", True):
+    # Use stub for local dev
+    from app.services.vector_store_stub import StubVectorStore
+    _ensure_collection = StubVectorStore.ensure_collection
+    _upsert_points = StubVectorStore.upsert_points
+    _deactivate_meeting_points = StubVectorStore.deactivate_meeting_points
+    _search_points = StubVectorStore.search_points
+```
+
+---
+
+## PRODUCTION READY CHECKLIST
+
+### Local Development:
+- [ ] Set up MySQL:10/11 locally or use Docker
+- [ ] Set up Redis locally (redis:7.4-alpine) or Docker
+- [ ] Configure GROQ_API_KEY for transcription
+- [ ] Configure OPENROUTER_API_KEY for embeddings and answering
+- [ ] Run tests first: `pytest` - ensure all tests pass
+- [ ] Start API with hot reload: `uvicorn app.main:app --reload`
+- [ ] Start Celery worker for pipeline: `celery -A app.workers.celery_app:celery_app worker`
+- [ ] Test with `python backend/test_local_api.py`
+
+### Local Dev Without Celery:
+- [ ] Create `backend/app/services/vector_store_stub.py`
+- [ ] Comment out S3 config for local dev
+- [ ] Run API directly (transcription fails but other API works)
+- [ ] Test authentication: POST `/api/v1/auth/login`
+- [ ] Test meetings: GET `/api/v1/meetings`
+- [ ] Test search: POST `/api/v1/search`
+
+### Production Deployment:
+- [ ] Use `docker-compose.yml` with full stack
+- [ ] Configure `QDRANT_URL` for cloud instance (or local if needed)
+- [ ] Remove `AWS_ENDPOINT_URL` for real S3
+- [ ] Set strict `SECRET_KEY` in production
+- [ ] Set `ALLOW_PUBLIC_SIGNUP=false`
+- [ ] Enable TLS (HTTPS) for frontend
+- [ ] Use AWS Secrets Manager or similar for API keys
+- [ ] Configure monitoring and logs
+
+---
+
+## KEY TAKEAWAYS
+
+1. **Local dev should be fast and isolated**: Use stubs and minimal services
+2. **Celery is not essential for local API testing**: You can test endpoints directly
+3. **Transcription requires actual audio**: Upload real files to S3 or provide temp paths
+4. **Vector search can be skipped in local dev**: Mock the results
+5. **Embeddings and answering work with OpenRouter**: Configure API keys properly
+6. **Development is iterative**: Start simple, add complexity as needed
+7. **Testing is critical**: Run tests frequently to catch regressions
+
+---
+
+## NEXT STEPS FOR LOCAL DEVELOPMENT
+
+1. **Set up MySQL**: Install MySQL 10+ or run with Docker
+2. **Set up Redis**: Run with Docker or local installation
+3. **Configure API Keys**: Get Groq and OpenRouter API keys
+4. **Create test meeting**: Use the OpenAPI docs at `http://localhost:8000/docs`
+5. **Start uploading audio**: Use the upload endpoint in the API docs
+6. **Monitor the pipeline**: Check Celery worker logs for status
+7. **Test recall**: Use the search endpoint to find content
+
+Once local development is stable, you can optimize and prepare for Docker deployment.
+
+=== END OF ORIGINAL ANALYSIS ===
+
+
+# ============================================================
+# SESSION UPDATE — July 30, 2026
+# ============================================================
+# This section documents all changes made during the setup &
+# debugging session.  Config, pipeline, search, CORS fixes.
+# ============================================================
+
+---
+
+## 1. CONFIGURATION OVERHAUL
+
+### API Keys Configured
+| Service | Key / Value |
+|---|---|
+| Groq (STT) | `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` |
+| OpenRouter (LLM + Embeddings) | `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` |
+| Qdrant Cloud | URL: `https://79c8925d-78ed-4da0-b4de-813f5a2b1270.eu-central-1-0.aws.cloud.qdrant.io:6333` |
+| Qdrant API Key | `eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...` |
+
+### Model Changes
+| Setting | Old Value | New Value |
+|---|---|---|
+| Embedding model | `sentence-transformers/all-minilm-l6-v2` | `openai/text-embedding-3-small` |
+| Embedding dimension | `384` | `1536` |
+| LLM model | `openai/gpt-oss-120b:free` (deprecated) | `openai/gpt-oss-20b:free` |
+| Score threshold | `0.3` (too high) | `0.15` |
+
+### Qdrant Collection
+- Name: `meeting_chunks`
+- Type: 1536-dim Cosine vectors
+- Host: Qdrant Cloud (not local)
+- Payload indexes: tenant_id, meeting_id, meeting_date, speaker_set, project, department, is_active
+
+### MySQL
+- Using local MySQL80 service (not Docker)
+- Host: `localhost:3306`
+- User: `root`
+- Database: `meetai`
+- Migrations: `alembic upgrade head` applied successfully
+
+---
+
+## 2. S3 REPLACED WITH LOCAL DISK
+
+**Problem:** The app required AWS S3 / LocalStack for file storage, which isn't available locally.
+
+**Fix in `backend/app/services/storage.py`:**
+- Added `save_file_locally()` — saves uploaded files to `local_storage/recordings/`
+- Added `head_local_file()` — returns file metadata from disk
+- `create_upload_url()` raises RuntimeError when S3 is unavailable (caught by routes)
+- `download_recording()` falls back to local file copy
+
+**Fix in `backend/app/api/routes/meetings.py`:**
+- Added `POST /meetings/{id}/upload` — direct multipart file upload endpoint
+- Uploaded file is saved to local disk, pipeline auto-starts
+- `create_meeting()` catches RuntimeError from `create_upload_url()` when S3 is absent
+- Sets `upload_url=""` to signal frontend to use direct upload
+
+---
+
+## 3. CELERY / REDIS REPLACED WITH SYNCHRONOUS PIPELINE
+
+**Problem:** Pipeline required Celery workers and Redis, unavailable locally.
+
+**Fix — created `backend/app/services/pipeline.py`:**
+- Extracted all 4 stage functions from Celery tasks into reusable module
+- Stages: `TRANSCRIBE` → `CLEAN` → `CHUNK` → `EMBED_INDEX`
+- `run_pipeline_sync()` runs all stages inline, one after another
+- Job tracking with `ProcessingJob` table (same as Celery)
+- Idempotency via `create_or_get_job()` — checks existing job before running
+
+**Fix in `backend/app/workers/tasks.py`:**
+- `enqueue_pipeline()` auto-detects dev mode (`APP_ENV=development`)
+- In dev: runs pipeline synchronously instead of dispatching to Celery
+- In production: still dispatches to Celery as before
+
+---
+
+## 4. ASYNC/SYNC BRIDGE FOR PIPELINE
+
+**Problem:** `run_pipeline_sync()` is called from a FastAPI async endpoint,
+but the `EMBED_INDEX` stage calls async functions (`embed_texts()`,
+`deactivate_meeting_points()`, `upsert_points()`) via `asyncio.run()`,
+which fails with `RuntimeError: asyncio.run() cannot be called from
+a running event loop`.
+
+**Fix in `backend/app/services/pipeline.py`:**
+- Added `_run_async(coro)` helper function
+- If no event loop is running → `asyncio.run(coro)`
+- If an event loop IS running → dispatches coroutine to a dedicated
+  thread pool (`ThreadPoolExecutor`) with its own event loop
+- All 3 `asyncio.run()` calls replaced with `_run_async()`
+
+---
+
+## 5. QDRANT CLIENT CROSS-EVENT-LOOP BUG
+
+**Problem:** `qdrant_client()` was decorated with `@lru_cache`. First
+call happened inside the pipeline thread (via `_run_async`'s temporary
+event loop). When search subsequently used the same cached client from
+the main async event loop, httpx silently failed because its internal
+resources were bound to the now-closed thread loop. Result: all Qdrant
+searches returned 0 points.
+
+**Fix in `backend/app/services/vector_store.py`:**
+- Removed `@lru_cache` from `qdrant_client()`
+- Fresh `AsyncQdrantClient` created on every call (lightweight — HTTP
+  config only, connections created lazily)
+- Removed unused `from functools import lru_cache`
+
+---
+
+## 6. DOCKER ENV VAR OVERRIDE FIX
+
+**Problem:** User's shell had stale Docker environment variables
+(e.g. `QDRANT_URL=http://qdrant:6333`, `OPENROUTER_EMBEDDING_MODEL=
+sentence-transformers/all-minilm-l6-v2`) that leaked from running
+docker-compose. pydantic-settings gives OS env vars priority over
+`.env`, so the Docker values were overriding local config.
+
+**Fix in `backend/app/core/config.py`:**
+- Added `_DOCKER_ENV_KEYS` frozenset with known Docker env var names
+- Added `_clear_stale_docker_envars()` classmethod that pops each key
+  from `os.environ` before pydantic reads settings
+- Called from `get_settings()` before constructing `Settings()`
+
+---
+
+## 7. AUTH SIMPLIFICATION
+
+**Problem:** Swagger UI Authorize button showed username/password
+fields incompatible with the JSON-based login flow.
+
+**Fix in `backend/app/api/deps.py`:**
+- Replaced `OAuth2PasswordBearer` with `HTTPBearer(auto_error=False)`
+- Swagger Authorize now shows a simple token Value field
+- Token extraction: reads from `HTTPAuthorizationCredentials` first,
+  falls back to raw `Authorization` header
+- Auth logic unchanged — still decodes JWT and validates user against DB
+
+---
+
+## 8. FRONTEND UPLOAD PAGE FIX
+
+**Problem:** Frontend upload page used the old S3 presigned URL flow
+(PUT to upload_url → POST /recordings/{id}/complete), which fails
+when S3 is unavailable.
+
+**Fix in `frontend/app/upload/page.tsx`:**
+- Rewrote upload flow to use direct upload:
+  1. `POST /meetings` to create meeting record (gets meeting_id)
+  2. `POST /meetings/{meeting_id}/upload` with multipart file
+  3. Navigate to meeting detail page
+- Uses XMLHttpRequest for upload progress tracking
+
+---
+
+## 9. ROOT CAUSE — SCORE THRESHOLD TOO HIGH
+
+**Problem:** Search returned "Insufficient evidence" for all queries.
+Debug logging added to `vector_store.py` and `retrieval.py` revealed
+that Qdrant was returning points, but `score_threshold=0.3` was
+filtering ALL results.
+
+**Diagnostic findings (1536-dim text-embedding-3-small):**
+| Query | Scores | Passed 0.3? |
+|---|---|---|
+| "who was from the pink city?" | 0.15-0.16 | ❌ |
+| "QBR" | 0.15-0.27 | ❌ |
+| "test" | 0.15-0.22 | ❌ |
+| "What was discussed?" | 0.31-0.35 | ✅ |
+
+**Fix:**
+- Changed `retrieval_score_threshold` from `0.3` → `0.15` in:
+  - `backend/app/core/config.py`
+  - `backend/.env` (this was overriding the config.py default)
+
+---
+
+## 10. FRONTEND PORT FORWARDING FIX
+
+**Problem:** When accessing the frontend through a forwarded/tunnel URL,
+the API calls to `http://localhost:8000` failed because the browser's
+localhost doesn't resolve to the server. Also, CORS was restricted to
+`http://localhost:3000`.
+
+**Backend fix (`backend/app/main.py`):**
+- Changed CORS from `allow_origins=[settings.frontend_url]` to
+  `allow_origins=["*"]` (development only)
+- Starlette echoes back the specific `Origin` header, not `*`,
+  so credentialed requests still work
+
+**Frontend fix (`frontend/lib/api.ts`):**
+- API URL now dynamically uses `window.location.protocol` +
+  `window.location.hostname:8000/api/v1` instead of hardcoded
+  `http://localhost:8000/api/v1`
+- Prevents mixed-content blocking when tunnel uses HTTPS
+- Falls back to `NEXT_PUBLIC_API_URL` env var if set
+
+---
+
+## 11. FILES CHANGED / CREATED
+
+### New files
+| File | Purpose |
+|---|---|
+| `backend/.env` | All API keys + local config |
+| `backend/app/services/pipeline.py` | Sync pipeline (replaces Celery) |
+| `.env` (project root) | Mirror of backend/.env for CWD compatibility |
+| `backend/debug_search.py` | Qdrant diagnostic (can delete) |
+| `backend/debug_search2.py` | Qdrant scroll diagnostic (can delete) |
+| `backend/debug_search3.py` | Score threshold test (can delete) |
+
+### Modified files
+| File | Changes |
+|---|---|
+| `backend/app/core/config.py` | Embedding model → text-embedding-3-small, 1536-dim, score 0.15, LLM → gpt-oss-20b:free, Docker env clearing |
+| `backend/app/services/storage.py` | Local file save/head functions |
+| `backend/app/services/pipeline.py` | _run_async helper for async/sync bridge |
+| `backend/app/services/vector_store.py` | Removed @lru_cache, added debug logging |
+| `backend/app/services/retrieval.py` | Added debug logging |
+| `backend/app/api/routes/meetings.py` | create_meeting handles S3 absence, direct upload endpoint |
+| `backend/app/api/deps.py` | OAuth2PasswordBearer → HTTPBearer |
+| `backend/app/main.py` | CORS allow all origins in development |
+| `frontend/app/upload/page.tsx` | Direct upload flow instead of S3 presigned |
+| `frontend/lib/api.ts` | Dynamic API URL for port forwarding |
+| `frontend/components/app-shell.tsx` | Auth session restore logic |
+| `backend/.env` | All 3 API keys, embedding model, LLM model, score threshold |
+
+---
+
+## 12. CURRENT STATE
+
+### Working ✅
+- MySQL connection (local MySQL80 service)
+- JWT auth (register, login, refresh)
+- Meeting upload via direct multipart upload
+- Groq Whisper transcription (`whisper-large-v3`)
+- Transcript cleaning + chunking
+- OpenRouter embeddings (`text-embedding-3-small`, 1536-dim)
+- Qdrant Cloud upsert + search
+- Score threshold set to 0.15 (returns results for most queries)
+- OpenRouter LLM for grounded answers (`gpt-oss-20b:free`)
+- Frontend connects via port forwarding (CORS + dynamic API URL)
+- All 9 backend tests pass
+- Frontend TypeScript typecheck passes
+
+### Not yet tested
+- Full search → answer end-to-end (user reported it failed at LLM model — fixed now)
+- Audio processing for longer meetings
+- Multiple concurrent users / tenants
+- Docker deployment
+
+---
+
+## 13. STARTUP COMMAND
+
+**Backend** (from `backend/` directory):
+```bash
+uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+**Frontend** (from `frontend/` directory):
+```bash
+npm run dev
+```
+
+---
+
+## 14. HEALTH CHECK ENDPOINTS
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /health/live` | Server is running |
+| `GET /health/ready` | MySQL, Qdrant, Redis, S3 status |
+| `GET /docs` | Swagger UI |
+
+---
+
+=== END OF SESSION UPDATE ===

@@ -1,0 +1,129 @@
+from __future__ import annotations
+
+import re
+from pathlib import Path
+from functools import lru_cache
+from typing import Any, cast
+
+import boto3
+from botocore.client import Config
+
+from app.core.config import get_settings
+
+LOCAL_STORAGE_ROOT = Path("local_storage") / "recordings"
+
+
+def safe_filename(filename: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", filename).strip(".-")
+    return cleaned[:180] or "recording"
+
+
+def recording_object_key(tenant_id: str, meeting_id: str, recording_id: str, filename: str) -> str:
+    return f"tenants/{tenant_id}/meetings/{meeting_id}/{recording_id}/{safe_filename(filename)}"
+
+
+# ── Local filesystem helpers (development fallback) ──
+
+def get_local_path(object_key: str) -> Path:
+    """Return the local filesystem path for a storage object key."""
+    return LOCAL_STORAGE_ROOT / object_key
+
+
+def save_file_locally(object_key: str, content: bytes) -> Path:
+    """Save file content to local disk under the given object key."""
+    path = get_local_path(object_key)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(content)
+    return path
+
+
+def head_local_file(object_key: str) -> dict[str, Any]:
+    """Return metadata for a locally stored file (mimics S3 head_object)."""
+    path = get_local_path(object_key)
+    if not path.exists():
+        raise FileNotFoundError(f"Local recording not found: {object_key}")
+    return {
+        "ContentLength": path.stat().st_size,
+        "ContentType": "",
+    }
+
+
+def _storage_available() -> bool:
+    """Check whether S3 credentials / endpoint are configured."""
+    settings = get_settings()
+    return bool(settings.aws_endpoint_url or (settings.aws_access_key_id and settings.aws_secret_access_key))
+
+
+# ── S3 client (production) ──
+
+def _client(endpoint_url: str | None) -> Any:
+    settings = get_settings()
+    return boto3.client(
+        "s3",
+        endpoint_url=endpoint_url,
+        region_name=settings.aws_region,
+        aws_access_key_id=settings.aws_access_key_id,
+        aws_secret_access_key=settings.aws_secret_access_key,
+        config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
+    )
+
+
+@lru_cache
+def internal_s3_client() -> Any:
+    return _client(get_settings().aws_endpoint_url)
+
+
+@lru_cache
+def public_s3_client() -> Any:
+    settings = get_settings()
+    return _client(settings.aws_public_endpoint_url or settings.aws_endpoint_url)
+
+
+# ── Unified API ──
+
+def create_upload_url(*, object_key: str, content_type: str, expires_seconds: int = 900) -> str:
+    """Generate a presigned S3 upload URL, or raise if S3 is not configured."""
+    if not _storage_available():
+        raise RuntimeError(
+            "S3 is not configured. Use the /upload endpoint to upload files directly "
+            "when running in development mode."
+        )
+    settings = get_settings()
+    return cast(
+        str,
+        public_s3_client().generate_presigned_url(
+            "put_object",
+            Params={
+                "Bucket": settings.aws_s3_bucket,
+                "Key": object_key,
+                "ContentType": content_type,
+                "ServerSideEncryption": "AES256",
+            },
+            ExpiresIn=expires_seconds,
+        ),
+    )
+
+
+def head_recording(object_key: str) -> dict[str, Any]:
+    """Check if a recording exists. Falls back to local filesystem if S3 is not configured."""
+    if not _storage_available():
+        return head_local_file(object_key)
+    return cast(
+        dict[str, Any],
+        internal_s3_client().head_object(
+            Bucket=get_settings().aws_s3_bucket,
+            Key=object_key,
+        ),
+    )
+
+
+def download_recording(object_key: str, destination: str) -> None:
+    """Download a recording to a local path. Falls back to local filesystem if S3 is not configured."""
+    if not _storage_available():
+        src = get_local_path(object_key)
+        if not src.exists():
+            raise FileNotFoundError(f"Local recording not found: {object_key}")
+        import shutil
+        shutil.copy2(str(src), destination)
+        return
+    internal_s3_client().download_file(get_settings().aws_s3_bucket, object_key, destination)
