@@ -2,6 +2,11 @@
 .env
 .env.*
 !.env.example
+.agents 
+
+# Local file storage fallback (S3 replacement for local dev)
+local_storage/
+backend/local_storage/
 
 # Python
 __pycache__/
