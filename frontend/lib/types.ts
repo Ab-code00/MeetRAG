@@ -38,3 +38,42 @@ export interface SearchResult {
   metadata: Record<string, string | null>;
 }
 
+export interface Citation {
+  marker: string;
+  chunk_id: string;
+  meeting_id: string;
+  meeting_title: string;
+  start_ms: number;
+  end_ms: number;
+  text: string;
+}
+
+export type ChatRole = "USER" | "ASSISTANT";
+
+export interface ChatSession {
+  id: string;
+  meeting_id: string;
+  title: string | null;
+  message_count: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ChatMessage {
+  id: string;
+  session_id: string;
+  role: ChatRole;
+  content: string;
+  citations: Citation[];
+  evidence_sufficient: boolean | null;
+  created_at: string;
+}
+
+export interface ChatMessageListResponse {
+  items: ChatMessage[];
+  total: number;
+  has_more: boolean;
+  limit: number;
+  offset: number;
+}
+

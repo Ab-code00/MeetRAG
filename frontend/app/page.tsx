@@ -1,7 +1,7 @@
 "use client";
 
 import { useQuery } from "@tanstack/react-query";
-import { ArrowRight, Plus, RefreshCw } from "lucide-react";
+import { ArrowRight, MessageCircle, Plus, RefreshCw } from "lucide-react";
 import Link from "next/link";
 import { AppShell } from "@/components/app-shell";
 import { StatusPill } from "@/components/status-pill";
@@ -30,14 +30,14 @@ export default function MeetingsPage() {
       {meetings.isError && <div className="error-banner">Could not load meetings.<button onClick={() => meetings.refetch()}><RefreshCw size={15} /> Retry</button></div>}
       {meetings.data?.items.length === 0 && <EmptyState title="No meetings yet" detail="Upload a recording to create searchable meeting knowledge." action={<Link className="button primary" href="/upload"><Plus size={17} /> Add recording</Link>} />}
       {!!meetings.data?.items.length && <div className="table-wrap"><table>
-        <thead><tr><th>Meeting</th><th>Date</th><th>Project</th><th>Duration</th><th>Status</th><th><span className="sr-only">Open</span></th></tr></thead>
+        <thead><tr><th>Meeting</th><th>Date</th><th>Project</th><th>Duration</th><th>Status</th><th><span className="sr-only">Actions</span></th></tr></thead>
         <tbody>{meetings.data.items.map((meeting) => <tr key={meeting.id}>
           <td><Link className="table-primary" href={`/meetings/${meeting.id}`}>{meeting.title}</Link><small>{meeting.department ?? "No department"}</small></td>
           <td>{meeting.meeting_date ? new Date(`${meeting.meeting_date}T00:00:00`).toLocaleDateString() : "Not set"}</td>
           <td>{meeting.project ?? "Not set"}</td>
           <td>{meeting.duration_ms ? formatTime(meeting.duration_ms) : "-"}</td>
           <td><StatusPill status={meeting.status} /></td>
-          <td><Link className="icon-button" href={`/meetings/${meeting.id}`} title="Open meeting"><ArrowRight size={17} /></Link></td>
+          <td><div className="row-actions"><Link className="icon-button" href={`/meetings/${meeting.id}/chat`} title="Chat with this meeting"><MessageCircle size={17} /></Link><Link className="icon-button" href={`/meetings/${meeting.id}`} title="Open meeting"><ArrowRight size={17} /></Link></div></td>
         </tr>)}</tbody>
       </table></div>}
     </AppShell>

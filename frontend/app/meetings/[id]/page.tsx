@@ -1,10 +1,12 @@
 "use client";
 
 import { useQuery } from "@tanstack/react-query";
-import { AlertTriangle, Calendar, Clock, RefreshCw, Users } from "lucide-react";
+import { AlertTriangle, Calendar, Clock, MessageCircle, RefreshCw, Users } from "lucide-react";
+import Link from "next/link";
 import { useParams } from "next/navigation";
 import { useState } from "react";
 import { AppShell } from "@/components/app-shell";
+import { MeetingChat } from "@/components/meeting-chat";
 import { StatusPill } from "@/components/status-pill";
 import { PageHeader, formatTime } from "@/components/ui";
 import { api } from "@/lib/api";
@@ -54,6 +56,8 @@ export default function MeetingDetailPage() {
       {transcript.data.segments.length === 0 && <div className="empty-inline">Raw transcript is not available yet.</div>}
       {transcript.data.segments.map((segment) => <article className="transcript-row" key={segment.id}><span className="timestamp">{formatTime(segment.start_ms)}</span><div><div className="speaker-line">{segment.speaker ?? "Unknown speaker"}</div><p>{segment.text}</p></div></article>)}
     </div>}
+    <div className="section-toolbar chat-toolbar"><div><h2>Chat with this meeting</h2><p>Ask questions — answers are grounded only in this meeting&apos;s transcript.</p></div><Link className="button secondary" href={`/meetings/${id}/chat`}><MessageCircle size={16} /> Open full chat</Link></div>
+    <MeetingChat meetingId={id} />
   </AppShell>;
 }
 
