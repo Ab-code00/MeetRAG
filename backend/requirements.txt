@@ -1,0 +1,32 @@
+# MeetAI backend runtime dependencies
+# Derived from backend/pyproject.toml [project].dependencies and pinned to the
+# exact versions verified in the project virtualenv (.venv).
+#
+# Install with:  pip install -r requirements.txt
+#
+# NOTE: The Docker image installs from pyproject.toml (`pip install .`), so this
+# file is not used in containers. It serves as a reproducible lockfile for local
+# development and non-Docker deployments. Transitive dependencies (e.g. pydantic,
+# starlette, greenlet, cryptography) are pulled in automatically by pip.
+
+alembic==1.18.5
+asyncmy==0.2.11
+boto3==1.43.51
+celery[redis]==5.6.3
+deepgram-sdk==3.11.0
+email-validator==2.3.0
+fastapi==0.139.2
+groq==0.37.1
+httpx==0.28.1
+orjson==3.11.9
+prometheus-client==0.25.0
+pydantic-settings==2.14.2
+pyjwt[crypto]==2.13.0
+pymysql==1.2.0
+pwdlib[argon2]==0.3.0
+python-multipart==0.0.32
+qdrant-client==1.18.0
+redis==5.3.1
+sqlalchemy==2.0.51
+structlog==25.5.0
+uvicorn[standard]==0.51.0
