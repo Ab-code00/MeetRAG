@@ -8,6 +8,10 @@ WORKDIR /app
 ARG NEXT_PUBLIC_API_URL
 ENV NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL
 COPY --from=dependencies /app/node_modules ./node_modules
+# The repo has no static assets, so public/ may be absent (empty dirs are not
+# tracked by git). Ensure it exists so the runner's COPY from this stage
+# never fails, while still picking up real files when the repo has them.
+RUN mkdir -p /app/public
 COPY . .
 RUN npm run build
 
