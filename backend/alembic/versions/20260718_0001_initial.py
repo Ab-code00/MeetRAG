@@ -4,7 +4,6 @@ Revision ID: 20260718_0001
 Revises:
 """
 from alembic import op
-
 from app.db.base import Base
 from app.models import entities  # noqa: F401
 

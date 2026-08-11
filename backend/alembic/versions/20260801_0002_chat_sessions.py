@@ -14,6 +14,14 @@ depends_on = None
 
 
 def upgrade() -> None:
+    from sqlalchemy import inspect
+
+    bind = op.get_bind()
+    if inspect(bind).has_table("chat_sessions"):
+        # Migration 0001 runs Base.metadata.create_all() with the CURRENT
+        # models, so a fresh database already contains every table. Guard each
+        # later migration so `alembic upgrade head` also works on an empty DB.
+        return
     op.create_table(
         "chat_sessions",
         sa.Column("id", sa.String(length=36), nullable=False),

@@ -14,6 +14,14 @@ depends_on = None
 
 
 def upgrade() -> None:
+    from sqlalchemy import inspect
+
+    bind = op.get_bind()
+    columns = {column["name"] for column in inspect(bind).get_columns("chat_sessions")}
+    if "last_message_ordinal" in columns:
+        # Already present (fresh installs get the full schema from 0001's
+        # metadata.create_all, and existing DBs migrated before this revision).
+        return
     op.add_column(
         "chat_sessions",
         sa.Column(
