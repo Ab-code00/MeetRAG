@@ -1,9 +1,49 @@
 from datetime import UTC, datetime
 
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from app.models import ChatMessage
 from app.models.enums import ChatRole
 from app.schemas.chat import ChatMessageResponse
 from app.schemas.search import Citation, SearchFilters, SearchRequest
+
+
+async def fetch_recent_history(
+    db: AsyncSession,
+    *,
+    session_id: str,
+    tenant_id: str,
+    turns: int,
+) -> list[tuple[str, str]]:
+    """
+    Load the most recent ``turns`` question/answer exchanges in chat order.
+
+    Returns ``(role, content)`` pairs with role in ``{"user", "assistant"}``.
+    The in-flight turn is persisted only after the LLM completes, so this
+    naturally returns just the prior conversation.
+    """
+    if turns <= 0:
+        return []
+    rows = (
+        await db.scalars(
+            select(ChatMessage)
+            .where(
+                ChatMessage.session_id == session_id,
+                ChatMessage.tenant_id == tenant_id,
+            )
+            .order_by(
+                ChatMessage.ordinal.desc(),
+                ChatMessage.created_at.desc(),
+                ChatMessage.id.desc(),
+            )
+            .limit(turns * 2)
+        )
+    ).all()
+    return [
+        (message.role.value.lower(), message.content)
+        for message in reversed(list(rows))
+    ]
 
 
 def scoped_search_request(query: str, meeting_id: str, top_k: int | None = None) -> SearchRequest:

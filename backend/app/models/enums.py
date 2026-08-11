@@ -50,3 +50,8 @@ class ChatRole(StrEnum):
     USER = "USER"
     ASSISTANT = "ASSISTANT"
 
+
+class ChunkType(StrEnum):
+    TURN = "TURN"
+    CONTEXT = "CONTEXT"
+

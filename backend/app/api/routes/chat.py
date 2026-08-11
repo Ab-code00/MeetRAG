@@ -9,6 +9,7 @@ from sqlalchemy import func, select
 
 from app.api.deps import Auth, DbSession, correlation_id
 from app.api.routes.meetings import _tenant_meeting
+from app.core.config import get_settings
 from app.models import ChatMessage, ChatSession
 from app.schemas.chat import (
     ChatAskRequest,
@@ -23,6 +24,7 @@ from app.services.answering import generate_grounded_answer, generate_grounded_a
 from app.services.audit import add_audit_log
 from app.services.chat import (
     build_chat_messages,
+    fetch_recent_history,
     message_to_response,
     scoped_search_request,
 )
@@ -187,6 +189,13 @@ async def ask_in_chat(
     db: DbSession,
 ) -> ChatMessageResponse:
     session = await _tenant_session(db, session_id, auth.tenant_id, auth.user_id)
+    settings = get_settings()
+    history = await fetch_recent_history(
+        db,
+        session_id=session.id,
+        tenant_id=auth.tenant_id,
+        turns=settings.chat_history_turns,
+    )
     try:
         search_response = await semantic_search(
             db,
@@ -202,6 +211,7 @@ async def ask_in_chat(
             question=payload.query,
             search=search_response,
             correlation_id=correlation_id(request),
+            history=history,
         )
     except ModelProviderError as exc:
         await db.rollback()
@@ -271,6 +281,13 @@ async def ask_in_chat_stream(
     constraint. On client disconnect (``CancelledError``) nothing is written.
     """
     session = await _tenant_session(db, session_id, auth.tenant_id, auth.user_id)
+    settings = get_settings()
+    history = await fetch_recent_history(
+        db,
+        session_id=session.id,
+        tenant_id=auth.tenant_id,
+        turns=settings.chat_history_turns,
+    )
 
     async def event_source() -> AsyncIterator[str]:
         try:
@@ -290,6 +307,7 @@ async def ask_in_chat_stream(
                 question=payload.query,
                 search=search_response,
                 correlation_id=correlation_id(request),
+                history=history,
             ):
                 # Narrow on the payload type, not the "kind" tag — mypy can't
                 # narrow a destructured tuple element via the sibling

@@ -9,7 +9,8 @@ from app.core.config import get_settings
 from app.models import Meeting, QdrantDocument, SearchQuery, TranscriptChunk, TranscriptChunkClean
 from app.schemas.search import SearchRequest, SearchResponse, SearchResult
 from app.services.openrouter import embed_texts
-from app.services.vector_store import search_points
+from app.services.sparse import sparse_vector
+from app.services.vector_store import hybrid_search_points
 
 
 async def semantic_search(
@@ -25,11 +26,13 @@ async def semantic_search(
     logger = structlog.get_logger()
 
     vector = (await embed_texts([payload.query]))[0]
+    sparse = sparse_vector(payload.query)
     logger.info(
         "semantic_search_debug",
         query=payload.query[:100],
         vector_dim=len(vector),
         vector_preview=[round(v, 4) for v in vector[:3]],
+        sparse_terms=len(sparse.indices),
         embedding_model=settings.openrouter_embedding_model,
         tenant_id=tenant_id,
         score_threshold=settings.retrieval_score_threshold,
@@ -37,23 +40,27 @@ async def semantic_search(
     )
 
     filter_data = payload.filters.model_dump(mode="json", exclude_none=True)
-    points = await search_points(
+    hits = await hybrid_search_points(
         tenant_id=tenant_id,
-        vector=vector,
+        dense_vector=vector,
+        sparse_vector=sparse,
         filters=filter_data,
         limit=payload.top_k or settings.retrieval_top_k,
+        candidate_count=settings.retrieval_hybrid_candidates,
         score_threshold=settings.retrieval_score_threshold,
     )
     logger.info(
         "semantic_search_points_found",
-        count=len(points),
+        count=len(hits),
         tenant_id=tenant_id,
     )
-    point_order = {str(point.id): index for index, point in enumerate(points)}
-    point_scores = {str(point.id): float(point.score) for point in points}
-    point_ids = list(point_order)
+    hit_payloads = [hit.payload or {} for hit in hits]
+    hit_order = {
+        str(payload.get("clean_chunk_id")): index for index, payload in enumerate(hit_payloads)
+    }
+    unit_clean_ids = list(hit_order)
     results: list[SearchResult] = []
-    if point_ids:
+    if unit_clean_ids:
         rows = (
             await db.execute(
                 select(QdrantDocument, TranscriptChunk, TranscriptChunkClean, Meeting)
@@ -61,7 +68,8 @@ async def semantic_search(
                 .join(TranscriptChunkClean, TranscriptChunkClean.id == QdrantDocument.clean_chunk_id)
                 .join(Meeting, Meeting.id == QdrantDocument.meeting_id)
                 .where(
-                    QdrantDocument.qdrant_point_id.in_(point_ids),
+                    QdrantDocument.clean_chunk_id.in_(unit_clean_ids),
+                    QdrantDocument.embedding_model == settings.openrouter_embedding_model,
                     QdrantDocument.tenant_id == tenant_id,
                     TranscriptChunk.tenant_id == tenant_id,
                     TranscriptChunkClean.tenant_id == tenant_id,
@@ -72,8 +80,15 @@ async def semantic_search(
                 )
             )
         ).all()
-        rows = sorted(rows, key=lambda row: point_order[row[0].qdrant_point_id])
+        rows = sorted(rows, key=lambda row: hit_order[row[0].clean_chunk_id])
+        score_by_unit = {str(payload.get("clean_chunk_id")): float(hit.score) for hit, payload in zip(hits, hit_payloads, strict=True)}
+        dense_by_unit = {str(payload.get("clean_chunk_id")): payload.get("dense_score") for payload in hit_payloads}
+        matched_by_unit = {
+            str(payload.get("clean_chunk_id")): payload.get("matched_type", "CONTEXT")
+            for payload in hit_payloads
+        }
         for document, chunk, clean, meeting in rows:
+            unit_id = str(document.clean_chunk_id)
             results.append(
                 SearchResult(
                     chunk_id=chunk.id,
@@ -85,13 +100,16 @@ async def semantic_search(
                     end_ms=chunk.end_ms,
                     speaker_set=chunk.speaker_set,
                     text=clean.cleaned_text,
-                    score=point_scores[document.qdrant_point_id],
+                    score=score_by_unit.get(unit_id, 0.0),
                     metadata={
                         "project": meeting.project,
                         "department": meeting.department,
                         "cleaning_version": clean.cleaning_version,
                         "chunk_strategy_version": chunk.chunk_strategy_version,
                         "embedding_model": document.embedding_model,
+                        "matched_type": matched_by_unit.get(unit_id, "CONTEXT"),
+                        "dense_score": dense_by_unit.get(unit_id),
+                        "turn_span": [chunk.turn_start, chunk.turn_end],
                     },
                 )
             )
@@ -111,4 +129,3 @@ async def semantic_search(
     db.add(query)
     await db.flush()
     return SearchResponse(query_id=query.id, results=results, latency_ms=latency_ms)
-

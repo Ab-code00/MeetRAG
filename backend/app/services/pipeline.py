@@ -12,10 +12,12 @@ import concurrent.futures
 import hashlib
 import time
 import uuid
+from collections.abc import Callable
 from datetime import UTC, datetime
-from typing import Any, Callable
+from typing import Any
 
 import structlog
+from qdrant_client import models as qmodels
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
@@ -32,8 +34,8 @@ from app.models import (
 from app.models.enums import JobStage, JobStatus, MeetingStatus
 from app.services.chunker import SourceSegment, chunk_segments
 from app.services.openrouter import embed_texts
+from app.services.sparse import sparse_vector
 from app.services.transcription import transcribe_recording
-from qdrant_client import models as qmodels
 from app.services.vector_store import deactivate_meeting_points, upsert_points
 
 logger = structlog.get_logger()
@@ -164,7 +166,7 @@ def run_clean(db: Session, meeting: Meeting) -> dict[str, Any]:
 
 
 def run_chunk(db: Session, meeting: Meeting) -> dict[str, Any]:
-    """Stage: chunk the cleaned transcript segments."""
+    """Stage: chunk the cleaned transcript segments into TURN + CONTEXT chunks."""
     settings = get_settings()
     raw = db.scalar(
         select(TranscriptRaw).where(
@@ -207,7 +209,7 @@ def run_chunk(db: Session, meeting: Meeting) -> dict[str, Any]:
         .order_by(TranscriptSegmentRaw.ordinal)
     ).all()
 
-    drafts = chunk_segments(
+    plan = chunk_segments(
         [
             SourceSegment(
                 id=item.id,
@@ -220,7 +222,9 @@ def run_chunk(db: Session, meeting: Meeting) -> dict[str, Any]:
         ],
         target_tokens=settings.chunk_target_tokens,
         max_tokens=settings.chunk_max_tokens,
-        overlap_ratio=settings.chunk_overlap_ratio,
+        min_turns=settings.chunk_min_turns,
+        max_turns=settings.chunk_max_turns,
+        overlap_turns=settings.chunk_overlap_turns,
     )
 
     # Deactivate old chunks
@@ -235,12 +239,22 @@ def run_chunk(db: Session, meeting: Meeting) -> dict[str, Any]:
     )
 
     now = datetime.now(UTC)
-    for ordinal, draft in enumerate(drafts):
+    context_ids: list[str] = []
+    ordinal = 0
+
+    def _insert_chunk(
+        draft: Any, *, parent_chunk_id: str | None
+    ) -> TranscriptChunk:
+        nonlocal ordinal
         chunk = TranscriptChunk(
             tenant_id=meeting.tenant_id,
             meeting_id=meeting.id,
             transcript_raw_id=raw.id,
             ordinal=ordinal,
+            chunk_type=draft.chunk_type,
+            turn_start=draft.turn_start,
+            turn_end=draft.turn_end,
+            parent_chunk_id=parent_chunk_id,
             start_ms=draft.start_ms,
             end_ms=draft.end_ms,
             speaker_set=draft.speakers,
@@ -252,6 +266,7 @@ def run_chunk(db: Session, meeting: Meeting) -> dict[str, Any]:
         )
         db.add(chunk)
         db.flush()
+        ordinal += 1
 
         metadata_parts = [
             f"Meeting: {meeting.title}",
@@ -259,6 +274,7 @@ def run_chunk(db: Session, meeting: Meeting) -> dict[str, Any]:
             f"Project: {meeting.project}" if meeting.project else None,
             f"Department: {meeting.department}" if meeting.department else None,
             f"Speakers: {', '.join(draft.speakers)}",
+            f"Chunk type: {draft.chunk_type.value.lower()}",
         ]
         metadata = " | ".join(part for part in metadata_parts if part)
         text_for_embedding = f"{metadata}\n\n{draft.cleaned_text}"
@@ -275,9 +291,26 @@ def run_chunk(db: Session, meeting: Meeting) -> dict[str, Any]:
                 created_at=now,
             )
         )
+        return chunk
+
+    # Context chunks first so TURN chunks can reference their parent ids.
+    for draft in plan.context_chunks:
+        context_ids.append(_insert_chunk(draft, parent_chunk_id=None).id)
+    for draft in plan.turn_chunks:
+        parent_id = (
+            context_ids[draft.parent_context_index]
+            if draft.parent_context_index is not None
+            else None
+        )
+        _insert_chunk(draft, parent_chunk_id=parent_id)
 
     meeting.status = MeetingStatus.CHUNKED
-    return {"chunk_count": len(drafts), "reused": False}
+    return {
+        "chunk_count": len(plan.all_chunks),
+        "context_chunk_count": len(plan.context_chunks),
+        "turn_chunk_count": len(plan.turn_chunks),
+        "reused": False,
+    }
 
 
 def run_embed_index(db: Session, meeting: Meeting) -> dict[str, Any]:
@@ -315,6 +348,9 @@ def run_embed_index(db: Session, meeting: Meeting) -> dict[str, Any]:
         .values(is_active=False)
     )
 
+    # Map every active clean chunk id (for TURN points to reference their parent).
+    clean_id_by_chunk_id: dict[str, str] = {chunk.id: clean.id for chunk, clean in rows}
+
     indexed = 0
     for start in range(0, len(rows), 32):
         batch = rows[start : start + 32]
@@ -349,15 +385,26 @@ def run_embed_index(db: Session, meeting: Meeting) -> dict[str, Any]:
 
             pending_documents.append(document)
 
+            parent_clean_id = (
+                clean_id_by_chunk_id.get(chunk.parent_chunk_id) if chunk.parent_chunk_id else None
+            )
             points.append(
                 qmodels.PointStruct(
                     id=document.qdrant_point_id,
-                    vector=vector,
+                    vector={
+                        "dense": vector,
+                        "sparse": sparse_vector(clean.text_for_embedding),
+                    },
                     payload={
                         "tenant_id": meeting.tenant_id,
                         "meeting_id": meeting.id,
                         "chunk_id": chunk.id,
                         "clean_chunk_id": clean.id,
+                        "chunk_type": chunk.chunk_type.value,
+                        "turn_start": chunk.turn_start,
+                        "turn_end": chunk.turn_end,
+                        "parent_chunk_id": chunk.parent_chunk_id,
+                        "parent_clean_chunk_id": parent_clean_id,
                         "meeting_title": meeting.title,
                         "meeting_date": (
                             f"{meeting.meeting_date.isoformat()}T00:00:00Z"

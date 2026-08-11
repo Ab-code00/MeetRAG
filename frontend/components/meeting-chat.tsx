@@ -45,6 +45,12 @@ export function MeetingChat({ meetingId }: { meetingId: string }) {
   const [pages, setPages] = useState<Record<number, ChatMessage[]>>({});
   const scrollRef = useRef<HTMLDivElement>(null);
   const streamAbortRef = useRef<AbortController | null>(null);
+  // Whether the user is anchored to the newest message. Updated on every scroll
+  // event (user or programmatic) so the stream-follow effect can check the
+  // position BEFORE the next delta grows the content — an inline check at
+  // render time would be measured against the already-grown height and stop
+  // following after a single large delta.
+  const stickToBottomRef = useRef(true);
 
   // Abort any in-flight stream when the component unmounts.
   useEffect(() => {
@@ -84,18 +90,12 @@ export function MeetingChat({ meetingId }: { meetingId: string }) {
     }
   }, [messages.data]);
 
-  // Scroll to the newest message when the latest page refreshes.
+  // Follow the text as it streams in — but only if the user was anchored to the
+  // bottom before this delta (see handleMessagesScroll): never yank someone
+  // who scrolled up to re-read an earlier message.
   useEffect(() => {
-    if (offset === 0 && messages.data) {
-      scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
-    }
-  }, [messages.data, offset]);
-
-  // Follow the text as it streams in.
-  useEffect(() => {
-    if (stream) {
-      scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
-    }
+    if (!stream || !stickToBottomRef.current) return;
+    scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
   }, [stream]);
 
   const createSession = useMutation({
@@ -140,8 +140,14 @@ export function MeetingChat({ meetingId }: { meetingId: string }) {
           ),
         onDone: () => {
           setStream(null);
-          setOffset(0);
-          setPages({});
+          // Already on the newest page? Keep it: the refetch replaces page 0,
+          // so the list never flashes empty between the stream ending and the
+          // completed turn being re-rendered. Jump back to the newest page
+          // only when the user had scrolled into older pages.
+          if (offset !== 0) {
+            setOffset(0);
+            setPages({});
+          }
           queryClient.invalidateQueries({ queryKey: ["chat-messages", sessionId] });
           queryClient.invalidateQueries({ queryKey: ["chats", meetingId] });
         },
@@ -168,11 +174,35 @@ export function MeetingChat({ meetingId }: { meetingId: string }) {
     }
   }
 
+  function handleMessagesScroll() {
+    const el = scrollRef.current;
+    stickToBottomRef.current = el
+      ? el.scrollHeight - el.scrollTop - el.clientHeight < 120
+      : true;
+  }
+
   // Combine fetched pages oldest-first: higher offsets are older and display first.
   const visible: ChatMessage[] = Object.keys(pages)
     .map(Number)
     .sort((a, b) => b - a)
     .flatMap((pageOffset) => pages[pageOffset].slice().reverse());
+
+  // The newest rendered message id — changes when a page loads, a turn
+  // completes, or the refetched newest page lands after a stream finishes.
+  const newestMessageId = visible.length > 0 ? visible[visible.length - 1].id : null;
+
+  // Pin the newest page to the bottom whenever its content changes. Deferred
+  // with requestAnimationFrame so it runs after the DOM reflects the new list:
+  // the previous code scrolled while `pages` was still empty right after a
+  // stream completed (the pages effect repopulates it one render later), which
+  // left the view stuck at the top of the conversation.
+  useEffect(() => {
+    if (offset !== 0 || !messages.data || !newestMessageId) return;
+    const frame = requestAnimationFrame(() => {
+      scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [offset, messages.data, newestMessageId]);
 
   const hasMore = Boolean(messages.data?.has_more);
   const currentSession = sessions.data?.items.find((item) => item.id === selectedId) ?? null;
@@ -213,7 +243,7 @@ export function MeetingChat({ meetingId }: { meetingId: string }) {
       </aside>
 
       <div className="chat-main">
-        <div className="chat-messages" ref={scrollRef}>
+        <div className="chat-messages" ref={scrollRef} onScroll={handleMessagesScroll}>
           {messages.isLoading && selectedId && visible.length === 0 && (
             <div className="chat-empty">Loading...</div>
           )}

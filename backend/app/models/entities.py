@@ -26,6 +26,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.db.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
 from app.models.enums import (
     ChatRole,
+    ChunkType,
     JobStage,
     JobStatus,
     MeetingStatus,
@@ -163,12 +164,26 @@ class TranscriptChunk(UUIDPrimaryKeyMixin, Base):
             "meeting_id", "chunk_strategy_version", "ordinal", name="uq_chunk_version_ordinal"
         ),
         Index("ix_chunks_meeting_active", "meeting_id", "is_active"),
+        Index("ix_chunks_meeting_type_active", "meeting_id", "chunk_type", "is_active"),
     )
 
     tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id"), nullable=False, index=True)
     meeting_id: Mapped[str] = mapped_column(ForeignKey("meetings.id"), nullable=False, index=True)
     transcript_raw_id: Mapped[str] = mapped_column(ForeignKey("transcripts_raw.id"), nullable=False)
     ordinal: Mapped[int] = mapped_column(Integer, nullable=False)
+    # TURN: one speaker turn (precision). CONTEXT: a rolling window of turns (understanding).
+    # Indexed via the composite ix_chunks_meeting_type_active (meeting_id, chunk_type, is_active).
+    chunk_type: Mapped[ChunkType] = mapped_column(
+        Enum(ChunkType), nullable=False, default=ChunkType.CONTEXT
+    )
+    # First/last source-segment ordinal (index into the ordered segment list) covered by this chunk.
+    turn_start: Mapped[int | None] = mapped_column(Integer)
+    turn_end: Mapped[int | None] = mapped_column(Integer)
+    # For TURN chunks: the CONTEXT chunk that contains this turn ("return the parent window").
+    # Indexed via ix_chunks_parent_chunk_id created in migration 20260811_0004.
+    parent_chunk_id: Mapped[str | None] = mapped_column(
+        ForeignKey("transcript_chunks.id", ondelete="SET NULL")
+    )
     start_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
     end_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
     speaker_set: Mapped[list[str]] = mapped_column(JSON, nullable=False)
@@ -177,6 +192,8 @@ class TranscriptChunk(UUIDPrimaryKeyMixin, Base):
     chunk_strategy_version: Mapped[str] = mapped_column(String(100), nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    parent: Mapped[TranscriptChunk | None] = relationship(remote_side="TranscriptChunk.id")
 
 
 class TranscriptChunkClean(UUIDPrimaryKeyMixin, Base):

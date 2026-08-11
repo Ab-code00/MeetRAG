@@ -15,7 +15,7 @@ from app.models import (
     TranscriptRaw,
     TranscriptSegmentRaw,
 )
-from app.models.enums import JobStage, MeetingStatus, RecordingStatus, UserRole
+from app.models.enums import ChunkType, JobStage, MeetingStatus, RecordingStatus, UserRole
 from app.schemas.meetings import (
     CleanChunkResponse,
     JobResponse,
@@ -291,6 +291,8 @@ async def get_transcript(meeting_id: str, request: Request, auth: Auth, db: DbSe
                 )
             ).all()
         )
+    # The clean reading view shows CONTEXT windows (conversation-level chunks);
+    # per-turn chunks serve retrieval precision and are visible in the raw view.
     rows = (
         await db.execute(
             select(TranscriptChunk, TranscriptChunkClean)
@@ -298,6 +300,7 @@ async def get_transcript(meeting_id: str, request: Request, auth: Auth, db: DbSe
             .where(
                 TranscriptChunk.meeting_id == meeting_id,
                 TranscriptChunk.tenant_id == auth.tenant_id,
+                TranscriptChunk.chunk_type == ChunkType.CONTEXT,
                 TranscriptChunk.is_active.is_(True),
             )
             .order_by(TranscriptChunk.ordinal)
@@ -308,6 +311,10 @@ async def get_transcript(meeting_id: str, request: Request, auth: Auth, db: DbSe
             chunk_id=chunk.id,
             clean_chunk_id=clean.id,
             ordinal=chunk.ordinal,
+            chunk_type=chunk.chunk_type.value,
+            turn_start=chunk.turn_start,
+            turn_end=chunk.turn_end,
+            parent_chunk_id=chunk.parent_chunk_id,
             start_ms=chunk.start_ms,
             end_ms=chunk.end_ms,
             speaker_set=chunk.speaker_set,

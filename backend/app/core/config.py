@@ -1,9 +1,9 @@
 import os
 from functools import lru_cache
+from typing import Annotated
 
 from pydantic import Field, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
-
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 # Environment variables from docker-compose that leak into the local shell.
 # These override the .env file (pydantic-settings gives env vars priority),
@@ -56,6 +56,16 @@ class Settings(BaseSettings):
     refresh_cookie_name: str = "meetai_refresh"
     cookie_domain: str | None = None
     allow_public_signup: bool = True
+    # Pipeline execution: auto (inline in development, Celery in production) |
+    # inline | celery. Inline runs the whole pipeline synchronously inside the
+    # request — required on free hosting where no broker/worker is available.
+    pipeline_mode: str = "auto"
+    # CORS origins for credentialed cross-origin requests (comma-separated in
+    # env). "*" is fine for local development; production must list the exact
+    # frontend origin(s) because credentialed requests can't use wildcards.
+    # NoDecode: pydantic-settings would otherwise try to JSON-decode the list
+    # env value and crash on a plain comma-separated string.
+    cors_origins: Annotated[list[str], NoDecode] = ["*"]
 
     database_url: str = "mysql+asyncmy://meetai:password@localhost:3306/meetai"
     database_url_sync: str = "mysql+pymysql://meetai:password@localhost:3306/meetai"
@@ -72,13 +82,18 @@ class Settings(BaseSettings):
 
     groq_api_key: str = ""
     groq_stt_model: str = "whisper-large-v3"
-    deepgram_api_key: str = "85765a7821760cb196b4bd527b7cee3b06ee1cfd"
+    # API keys must never be hardcoded defaults — set DEEPGRAM_API_KEY in .env
+    # only. (A previous real key committed here was leaked; rotate it.)
+    deepgram_api_key: str = ""
     deepgram_stt_model: str = "nova-3"
     # auto | groq | deepgram — auto prefers Deepgram when DEEPGRAM_API_KEY is set
     transcription_provider: str = "auto"
     openrouter_api_key: str = ""
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
-    openrouter_llm_model: str = "OpenAI: gpt-oss-120b"
+    openrouter_llm_model: str = "openai/gpt-5.6-luna"
+    # Hard cap on total output tokens (answer + any chain-of-thought) so a
+    # slow/queueing provider can't run to the context limit and stall chats.
+    openrouter_llm_max_tokens: int = 2048
     openrouter_embedding_model: str = "openai/text-embedding-3-small"
     openrouter_app_url: str = ""
     openrouter_app_name: str = "MeetAI"
@@ -89,13 +104,29 @@ class Settings(BaseSettings):
     embedding_dimension: int = 1536
 
     cleaning_version: str = "clean-v1"
-    chunking_version: str = "speaker-semantic-v1"
+    chunking_version: str = "speaker-context-v2"
     answer_prompt_version: str = "grounded-v1"
+    # Answer-generation prompt bounds: feed at most this many evidence chunks
+    # and truncate each block to this many characters so the prompt (and thus
+    # first-token latency) stays small.
+    answer_evidence_limit: int = 5
+    answer_evidence_max_chars: int = 2000
+    # Multi-turn chat context: the last N question/answer exchanges from the
+    # session are sent to the LLM so follow-ups like "was this his answer?"
+    # have referents. Each prior message is truncated to this many characters.
+    chat_history_turns: int = 5
+    chat_history_max_chars: int = 1500
     chunk_target_tokens: int = 700
     chunk_max_tokens: int = 900
-    chunk_overlap_ratio: float = 0.15
+    # Two-level chunking (see chunking_strategy.md): context chunks group
+    # several consecutive speaker turns; overlap carries whole turns forward.
+    chunk_min_turns: int = 4
+    chunk_max_turns: int = 10
+    chunk_overlap_turns: int = 2
     retrieval_top_k: int = 8
     retrieval_score_threshold: float = 0.10
+    # Hybrid retrieval: dense top-N + BM25 sparse top-N candidates fused via RRF.
+    retrieval_hybrid_candidates: int = 40
 
     @property
     def stt_provider(self) -> str:
@@ -115,6 +146,20 @@ class Settings(BaseSettings):
         if value not in ("auto", "groq", "deepgram"):
             raise ValueError("TRANSCRIPTION_PROVIDER must be one of: auto, groq, deepgram")
         return str(value)
+
+    @field_validator("pipeline_mode")
+    @classmethod
+    def validate_pipeline_mode(cls, value: object) -> str:
+        if value not in ("auto", "inline", "celery"):
+            raise ValueError("PIPELINE_MODE must be one of: auto, inline, celery")
+        return str(value)
+
+    @field_validator("cors_origins", mode="before")
+    @classmethod
+    def split_cors_origins(cls, value: object) -> object:
+        if isinstance(value, str):
+            return [item.strip() for item in value.split(",") if item.strip()]
+        return value
 
     @field_validator("aws_endpoint_url", "aws_public_endpoint_url", "cookie_domain", mode="before")
     @classmethod

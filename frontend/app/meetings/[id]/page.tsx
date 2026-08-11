@@ -16,7 +16,7 @@ type Transcript = {
   raw_text: string | null;
   stt_model: string | null;
   segments: { id: string; start_ms: number; end_ms: number; speaker: string | null; text: string }[];
-  clean_chunks: { chunk_id: string; start_ms: number; end_ms: number; speaker_set: string[]; cleaned_text: string; cleaning_version: string; chunk_strategy_version: string }[];
+  clean_chunks: { chunk_id: string; start_ms: number; end_ms: number; speaker_set: string[]; cleaned_text: string; cleaning_version: string; chunk_strategy_version: string; chunk_type: string }[];
 };
 type Detail = Meeting & { recordings: { id: string; original_filename: string; size_bytes: number | null }[] };
 

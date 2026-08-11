@@ -82,6 +82,10 @@ class CleanChunkResponse(BaseModel):
     chunk_id: str
     clean_chunk_id: str
     ordinal: int
+    chunk_type: str
+    turn_start: int | None
+    turn_end: int | None
+    parent_chunk_id: str | None
     start_ms: int
     end_ms: int
     speaker_set: list[str]

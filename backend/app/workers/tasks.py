@@ -33,8 +33,13 @@ def enqueue_pipeline(
 
     settings = get_settings()
 
-    # In development mode without Celery, run synchronously
-    if settings.app_env == "development":
+    # Resolve the execution mode: auto follows the environment (inline in
+    # development, Celery in production); inline forces synchronous execution
+    # (needed on free hosting where no broker/worker is available).
+    mode = settings.pipeline_mode
+    if mode == "auto":
+        mode = "inline" if settings.app_env == "development" else "celery"
+    if mode == "inline":
         result = _run_inline(
             meeting_id=meeting_id,
             tenant_id=tenant_id,
@@ -94,7 +99,6 @@ def process_stage(
     run_id: str | None = None,
 ) -> dict[str, Any]:
     """Celery task that executes a single pipeline stage and chains to the next."""
-    from typing import Any
 
     stage = JobStage(stage_value)
     with SyncSessionLocal() as db:

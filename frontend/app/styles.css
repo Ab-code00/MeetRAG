@@ -140,6 +140,8 @@ button.timestamp { cursor: pointer; }
 .evidence-row { display: grid; grid-template-columns: 44px minmax(0, 1fr); gap: 14px; padding: 16px 0; border-bottom: 1px solid var(--border); }
 .evidence-row p { margin: 8px 0 4px; color: #435255; line-height: 1.6; overflow-wrap: anywhere; }
 .evidence-row small { color: var(--muted); }
+.match-type { display: inline-block; margin-left: 8px; padding: 1px 7px; border-radius: 10px; background: var(--info-soft); color: var(--info); font-size: 10px; font-weight: 650; letter-spacing: 0.02em; text-transform: uppercase; }
+.match-type.turn { background: var(--accent-soft); color: var(--accent); }
 .citation-marker, .score { display: inline-flex; width: 40px; height: 28px; align-items: center; justify-content: center; border-radius: 5px; background: var(--info-soft); color: var(--info); font-size: 11px; font-weight: 700; }
 .score { background: var(--accent-soft); color: var(--accent); }
 .evidence-meta { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px 20px; }

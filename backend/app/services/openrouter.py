@@ -21,6 +21,21 @@ class CompletionResult:
     latency_ms: int
 
 
+# A prior chat exchange: ``(role, content)`` with role in {"user", "assistant"}.
+HistoryMessage = tuple[str, str]
+
+
+def _build_messages(
+    *, system_prompt: str, history: list[HistoryMessage] | None, user_prompt: str
+) -> list[dict[str, str]]:
+    """Assemble the chat-completions array: system → prior turns → current user turn."""
+    messages: list[dict[str, str]] = [{"role": "system", "content": system_prompt}]
+    for role, content in history or []:
+        messages.append({"role": role, "content": content})
+    messages.append({"role": "user", "content": user_prompt})
+    return messages
+
+
 # Events emitted by :func:`grounded_completion_stream`: a ``("delta", text)``
 # event per token chunk, then a final ``("result", CompletionResult)`` event.
 CompletionStreamEvent = (
@@ -67,7 +82,12 @@ async def embed_texts(texts: list[str]) -> list[list[float]]:
     return vectors
 
 
-async def grounded_completion(*, system_prompt: str, user_prompt: str) -> CompletionResult:
+async def grounded_completion(
+    *,
+    system_prompt: str,
+    user_prompt: str,
+    history: list[HistoryMessage] | None = None,
+) -> CompletionResult:
     settings = get_settings()
     started = time.perf_counter()
     async with httpx.AsyncClient(timeout=180) as client:
@@ -76,11 +96,13 @@ async def grounded_completion(*, system_prompt: str, user_prompt: str) -> Comple
             headers=_headers(),
             json={
                 "model": settings.openrouter_llm_model,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
+                "messages": _build_messages(
+                    system_prompt=system_prompt, history=history, user_prompt=user_prompt
+                ),
                 "temperature": 0.1,
+                # Bound the answer (and any model chain-of-thought) so a
+                # slow/queueing provider can't run to the context limit.
+                "max_tokens": settings.openrouter_llm_max_tokens,
             },
         )
     if response.is_error:
@@ -100,7 +122,10 @@ async def grounded_completion(*, system_prompt: str, user_prompt: str) -> Comple
 
 
 async def grounded_completion_stream(
-    *, system_prompt: str, user_prompt: str
+    *,
+    system_prompt: str,
+    user_prompt: str,
+    history: list[HistoryMessage] | None = None,
 ) -> AsyncIterator[CompletionStreamEvent]:
     """
     Stream a grounded completion from OpenRouter (SSE over HTTP).
@@ -121,12 +146,14 @@ async def grounded_completion_stream(
             headers=_headers(),
             json={
                 "model": settings.openrouter_llm_model,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
+                "messages": _build_messages(
+                    system_prompt=system_prompt, history=history, user_prompt=user_prompt
+                ),
                 "temperature": 0.1,
                 "stream": True,
+                # Bound the answer (and any model chain-of-thought) so a
+                # slow/queueing provider can't run to the context limit.
+                "max_tokens": settings.openrouter_llm_max_tokens,
             },
         ) as response:
             if response.is_error:

@@ -6,6 +6,14 @@ import { FormEvent, useState } from "react";
 import { AppShell } from "@/components/app-shell";
 import { PageHeader } from "@/components/ui";
 import { api, ApiError } from "@/lib/api";
+import type { UploadTarget } from "@/lib/types";
+
+async function sha256(file: File): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", await file.arrayBuffer());
+  return Array.from(new Uint8Array(digest))
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
+}
 
 export default function UploadPage() {
   const router = useRouter();
@@ -13,6 +21,33 @@ export default function UploadPage() {
   const [progress, setProgress] = useState(0);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+
+  function uploadWithProgress(xhr: XMLHttpRequest, body: XMLHttpRequestBodyInit) {
+    return new Promise<void>((resolve, reject) => {
+      xhr.upload.onprogress = (event) => {
+        if (event.lengthComputable) {
+          setProgress(Math.round((event.loaded / event.total) * 100));
+        }
+      };
+      xhr.onload = () => (xhr.status >= 200 && xhr.status < 300 ? resolve() : reject(new Error("Upload failed")));
+      xhr.onerror = () => reject(new Error("Upload failed"));
+      xhr.send(body);
+    });
+  }
+
+  // Direct API upload (multipart) — used when no S3 is configured, or as a
+  // fallback when the S3 presigned PUT fails (e.g. LocalStack down in dev).
+  function directUpload(meetingId: string, fileToUpload: File) {
+    const formData = new FormData();
+    formData.append("file", fileToUpload);
+    const xhr = new XMLHttpRequest();
+    xhr.open(
+      "POST",
+      `${process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000/api/v1"}/meetings/${meetingId}/upload`
+    );
+    xhr.setRequestHeader("Authorization", `Bearer ${sessionStorage.getItem("meetai_access") || ""}`);
+    return uploadWithProgress(xhr, formData);
+  }
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -23,8 +58,8 @@ export default function UploadPage() {
     const data = new FormData(event.currentTarget);
 
     try {
-      // Step 1: Create the meeting record
-      const meeting = await api<{ meeting_id: string; recording_id: string }>("/meetings", {
+      // Step 1: Create the meeting record (+ S3 presigned URL when configured)
+      const meeting = await api<UploadTarget>("/meetings", {
         method: "POST",
         headers: { "Idempotency-Key": crypto.randomUUID() },
         body: JSON.stringify({
@@ -38,27 +73,30 @@ export default function UploadPage() {
         }),
       });
 
-      // Step 2: Upload the file directly (multipart) — pipeline auto-starts
-      const formData = new FormData();
-      formData.append("file", file);
-
-      // Use XMLHttpRequest for upload progress tracking
-      await new Promise<void>((resolve, reject) => {
-        const xhr = new XMLHttpRequest();
-        xhr.open(
-          "POST",
-          `${process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000/api/v1"}/meetings/${meeting.meeting_id}/upload`
-        );
-        xhr.setRequestHeader("Authorization", `Bearer ${sessionStorage.getItem("meetai_access") || ""}`);
-        xhr.upload.onprogress = (event) => {
-          if (event.lengthComputable) {
-            setProgress(Math.round((event.loaded / event.total) * 100));
+      if (meeting.upload_url) {
+        try {
+          // Step 2a: S3 path — PUT straight to the presigned URL (durable on
+          // hosting with ephemeral disks, e.g. Render free), then finalize.
+          const xhr = new XMLHttpRequest();
+          xhr.open("PUT", meeting.upload_url);
+          for (const [key, value] of Object.entries(meeting.upload_headers)) {
+            xhr.setRequestHeader(key, value);
           }
-        };
-        xhr.onload = () => (xhr.status >= 200 && xhr.status < 300 ? resolve() : reject(new Error("Upload failed")));
-        xhr.onerror = () => reject(new Error("Upload failed"));
-        xhr.send(formData);
-      });
+          await uploadWithProgress(xhr, file);
+          const checksum = await sha256(file);
+          await api(`/meetings/${meeting.meeting_id}/recordings/${meeting.recording_id}/complete`, {
+            method: "POST",
+            body: JSON.stringify({ size_bytes: file.size, checksum_sha256: checksum }),
+          });
+        } catch {
+          // S3 unreachable (LocalStack down in dev, expired URL, network) —
+          // fall back to the direct API upload so the recording still lands.
+          await directUpload(meeting.meeting_id, file);
+        }
+      } else {
+        // Step 2b: Direct API upload (no S3 configured — dev mode).
+        await directUpload(meeting.meeting_id, file);
+      }
 
       router.push(`/meetings/${meeting.meeting_id}`);
     } catch (caught) {

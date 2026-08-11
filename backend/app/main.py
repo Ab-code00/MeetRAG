@@ -16,7 +16,7 @@ from app.core.logging import configure_logging
 from app.core.middleware import CorrelationMiddleware
 from app.db.session import AsyncSessionLocal
 from app.services.storage import internal_s3_client
-from app.services.vector_store import qdrant_client
+from app.services.vector_store import ensure_collection, qdrant_client
 
 configure_logging()
 settings = get_settings()
@@ -25,6 +25,10 @@ settings = get_settings()
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     structlog.get_logger().info("application_starting", environment=settings.app_env)
+    # Create/recreate the hybrid (dense + BM25 sparse) Qdrant collection at
+    # startup so searches never hit a legacy dense-only schema. Existing
+    # vectors are recreated away — reprocess meetings to reindex them.
+    await ensure_collection()
     yield
     structlog.get_logger().info("application_stopping")
 
@@ -41,7 +45,10 @@ app = FastAPI(
 app.add_middleware(CorrelationMiddleware)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    # Credentialed cross-origin requests (refresh-token cookies) reject the
+    # "*" wildcard, so production must list the exact frontend origin(s) via
+    # CORS_ORIGINS (e.g. https://meetai.onrender.com).
+    allow_origins=settings.cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

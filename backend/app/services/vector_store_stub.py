@@ -7,8 +7,6 @@ when Qdrant is not available in the local environment.
 """
 from typing import Any
 
-# Re-export functions and classes for compatibility
-from app.core.config import get_settings
 
 class StubQdrantClient:
     """No-op Qdrant client for local development"""
@@ -56,36 +54,20 @@ class StubQdrantClient:
     async def query_points(
         self,
         collection_name: str,
-        query: list | None,
+        query: Any | None,
         query_filter: Any | None,
         limit: int | None = None,
         score_threshold: float | None = None,
+        using: str | None = None,
         with_payload: bool = True,
-        with_vectors: bool = False
-    ):
-        """Return empty points list for compatibility"""
+        with_vectors: bool = False,
+    ) -> Any:
+        """Return an empty points result for compatibility"""
         class EmptyPoints:
-            def __init__(self):
+            def __init__(self) -> None:
                 self.points = []
 
-        # Temporarily replace qdrant_client to use stub
-        from app.services.vector_store import qdrant_client
-        import app.services.vector_store as vector_store
-
-        # Replace with key from stub
-        real_client = qdrant_client()
-
-        # Use a temporary stub
-        original_client = vector_store.qdrant_client
-
-        # Set to a safe client (doesn't matter for this stub)
-        vector_store.qdrant_client = lambda: StubQdrantClient()
-
-        try:
-            from app.services.vector_store import search_points as real_search
-            return EmptyPoints()
-        finally:
-            vector_store.qdrant_client = original_client
+        return EmptyPoints()
 
 
 # Functions for compatibility with existing code
@@ -104,7 +86,21 @@ async def deactivate_meeting_points(tenant_id: str, meeting_id: str):
     pass
 
 
-async def search_points(*, tenant_id: str, vector: list, filters: dict, limit: int, score_threshold: float):
+async def hybrid_search_points(
+    *,
+    tenant_id: str,
+    dense_vector: list | None,
+    sparse_vector: Any | None,
+    filters: dict,
+    limit: int,
+    candidate_count: int,
+    score_threshold: float,
+):
+    """Return empty results - no vector search in local development"""
+    return []
+
+
+def rrf_fuse(ranked_lists: list, *, k: int = 60):
     """Return empty results - no vector search in local development"""
     return []
 
@@ -120,7 +116,8 @@ __all__ = [
     "ensure_collection",
     "upsert_points",
     "deactivate_meeting_points",
-    "search_points",
+    "hybrid_search_points",
+    "rrf_fuse",
     "qdrant_client",
     "StubQdrantClient",
 ]

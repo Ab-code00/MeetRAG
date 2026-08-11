@@ -27,8 +27,35 @@ Do not invent people, dates, decisions, or action items. Be concise and direct."
 AnswerStreamEvent = tuple[Literal["delta"], str] | tuple[Literal["result"], AskResponse]
 
 
-def _build_evidence(search: SearchResponse) -> tuple[list[str], dict[str, Citation]]:
-    """Build the evidence prompt blocks and the marker → citation map."""
+def _truncate_evidence(text: str, limit: int) -> str:
+    """Gracefully truncate an evidence block at a sentence boundary."""
+    if len(text) <= limit:
+        return text
+    cut = text[:limit]
+    for boundary in (". ", "? ", "! "):
+        index = cut.rfind(boundary)
+        if index >= limit // 2:
+            return cut[: index + 1]
+    return cut
+
+
+def _build_evidence(
+    search: SearchResponse,
+    *,
+    max_blocks: int | None = None,
+    max_chars: int | None = None,
+) -> tuple[list[str], dict[str, Citation]]:
+    """Build the evidence prompt blocks and the marker → citation map.
+
+    Only the top ``answer_evidence_limit`` results are included in the prompt,
+    each truncated to ``answer_evidence_max_chars``, so the LLM prompt stays
+    bounded (8 full 300–700-token context chunks ≈ 5k+ tokens delays the first
+    token significantly on slow/free-tier models). The citation map still
+    covers every result, so markers remain valid either way.
+    """
+    settings = get_settings()
+    block_limit = max_blocks if max_blocks is not None else settings.answer_evidence_limit
+    char_limit = max_chars if max_chars is not None else settings.answer_evidence_max_chars
     evidence_blocks: list[str] = []
     citations_by_marker: dict[str, Citation] = {}
     for index, result in enumerate(search.results, start=1):
@@ -36,7 +63,8 @@ def _build_evidence(search: SearchResponse) -> tuple[list[str], dict[str, Citati
         evidence_blocks.append(
             f"[{marker}] Meeting: {result.meeting_title} ({result.meeting_id})\n"
             f"Time: {result.start_ms}-{result.end_ms} ms\n"
-            f"Speakers: {', '.join(result.speaker_set)}\n{result.text}"
+            f"Speakers: {', '.join(result.speaker_set)}\n"
+            f"{_truncate_evidence(result.text, char_limit)}"
         )
         citations_by_marker[marker] = Citation(
             marker=marker,
@@ -47,7 +75,7 @@ def _build_evidence(search: SearchResponse) -> tuple[list[str], dict[str, Citati
             end_ms=result.end_ms,
             text=result.text,
         )
-    return evidence_blocks, citations_by_marker
+    return evidence_blocks[:block_limit], citations_by_marker
 
 
 def _finalize_answer(
@@ -65,6 +93,24 @@ def _finalize_answer(
     return answer_text, citations, evidence_sufficient
 
 
+# Prior assistant answers contain inline [C1]-style markers that only made
+# sense against their own evidence block. Strip them from history so the model
+# can't cite stale markers or collide with the fresh markers of the new turn.
+_HISTORY_CITATION_PATTERN = re.compile(r"\s*\[C\d+\]")
+
+
+def _truncated_history(
+    history: list[tuple[str, str]] | None, max_chars: int
+) -> list[tuple[str, str]] | None:
+    """Strip stale citation markers and cap each prior message."""
+    if not history:
+        return None
+    return [
+        (role, _truncate_evidence(_HISTORY_CITATION_PATTERN.sub("", content), max_chars))
+        for role, content in history
+    ]
+
+
 async def generate_grounded_answer(
     db: AsyncSession,
     *,
@@ -73,6 +119,7 @@ async def generate_grounded_answer(
     question: str,
     search: SearchResponse,
     correlation_id: str,
+    history: list[tuple[str, str]] | None = None,
 ) -> AskResponse:
     settings = get_settings()
     if not search.results:
@@ -84,7 +131,11 @@ async def generate_grounded_answer(
         )
     evidence_blocks, citations_by_marker = _build_evidence(search)
     user_prompt = f"QUESTION:\n{question}\n\nEVIDENCE:\n\n" + "\n\n".join(evidence_blocks)
-    completion = await grounded_completion(system_prompt=SYSTEM_PROMPT, user_prompt=user_prompt)
+    completion = await grounded_completion(
+        system_prompt=SYSTEM_PROMPT,
+        user_prompt=user_prompt,
+        history=_truncated_history(history, settings.chat_history_max_chars),
+    )
     answer_text, citations, evidence_sufficient = _finalize_answer(
         completion=completion,
         citations_by_marker=citations_by_marker,
@@ -123,6 +174,7 @@ async def generate_grounded_answer_stream(
     question: str,
     search: SearchResponse,
     correlation_id: str,
+    history: list[tuple[str, str]] | None = None,
 ) -> AsyncIterator[AnswerStreamEvent]:
     """
     Stream a grounded answer as token deltas.
@@ -148,7 +200,9 @@ async def generate_grounded_answer_stream(
     user_prompt = f"QUESTION:\n{question}\n\nEVIDENCE:\n\n" + "\n\n".join(evidence_blocks)
     completion: CompletionResult | None = None
     async for event in grounded_completion_stream(
-        system_prompt=SYSTEM_PROMPT, user_prompt=user_prompt
+        system_prompt=SYSTEM_PROMPT,
+        user_prompt=user_prompt,
+        history=_truncated_history(history, settings.chat_history_max_chars),
     ):
         # Narrow on the payload type, not the "kind" tag — mypy can't narrow a
         # destructured tuple element via the sibling discriminant.

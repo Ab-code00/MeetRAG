@@ -1,3 +1,11 @@
+export interface UploadTarget {
+  meeting_id: string;
+  recording_id: string;
+  upload_url: string;
+  upload_headers: Record<string, string>;
+  expires_in: number;
+}
+
 export type MeetingStatus =
   | "PENDING"
   | "TRANSCRIBING"
@@ -24,6 +32,17 @@ export interface Meeting {
   created_at: string;
 }
 
+export interface SearchResultMetadata {
+  project: string | null;
+  department: string | null;
+  cleaning_version: string | null;
+  chunk_strategy_version: string | null;
+  embedding_model: string | null;
+  matched_type: "TURN" | "CONTEXT" | null;
+  dense_score: number | null;
+  turn_span: [number | null, number | null] | null;
+}
+
 export interface SearchResult {
   chunk_id: string;
   clean_chunk_id: string;
@@ -35,7 +54,7 @@ export interface SearchResult {
   speaker_set: string[];
   text: string;
   score: number;
-  metadata: Record<string, string | null>;
+  metadata: SearchResultMetadata;
 }
 
 export interface Citation {

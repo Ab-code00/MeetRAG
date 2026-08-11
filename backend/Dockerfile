@@ -15,5 +15,9 @@ RUN pip install --upgrade pip && pip install .
 
 USER meetai
 EXPOSE 8000
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Migrations are idempotent (fresh-install safe), so running them at boot is
+# cheap and lets the container provision a brand-new database on first deploy.
+# Retry a few times first: the DB (e.g. a free tier that powers off when idle)
+# may not be reachable during the very first seconds after deploy.
+CMD ["sh", "-c", "i=0; until alembic upgrade head; do i=$((i+1)); [ $i -ge 10 ] && break; echo 'database not ready, retrying in 5s'; sleep 5; done; uvicorn app.main:app --host 0.0.0.0 --port 8000"]
 
