@@ -1,5 +1,6 @@
 import os
 from functools import lru_cache
+from pathlib import Path
 from typing import Annotated
 
 from pydantic import Field, field_validator
@@ -25,6 +26,20 @@ _DOCKER_ENV_KEYS: frozenset[str] = frozenset({
     "ANTHROPIC_BASE_URL",
 })
 
+# docker-compose internal hostnames used by this repo's compose file (services
+# named mysql / redis / qdrant / localstack). A value containing one of these
+# markers can only have come from docker-compose or a shell that inherited its
+# environment; real database/vector/queue hosts never match.
+_CONTAINER_HOST_MARKERS: tuple[str, ...] = (
+    "@mysql:",
+    "@redis:",
+    "@qdrant:",
+    "redis://redis:",
+    "http://qdrant:",
+    "http://localstack:",
+    "http://localhost:4566",
+)
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -37,13 +52,23 @@ class Settings(BaseSettings):
         Remove docker-compose environment variables that leaked into the
         developer's shell, so that the local ``.env`` file takes effect.
 
-        pydantic-settings gives OS environment variables priority over
-        ``.env``, but when a developer has run ``docker compose up`` or
-        ``conda env config vars`` the container addresses persist in the
-        shell and break local development.
+        This must NEVER clear environment variables inside a container: on
+        Render and in docker-compose the process environment IS the
+        configuration (the image contains no ``.env`` file), so an
+        unconditional pop made cloud deploys fall back to the localhost
+        defaults and fail to connect. Only clear a variable when BOTH hold:
+          1. a local ``.env`` file exists (i.e. we are on the dev host), and
+          2. the value still points at docker-compose internal hostnames
+             (a stale leak, e.g. DATABASE_URL ending in ``@mysql:3306``).
         """
+        if not Path(".env").exists():
+            # No .env file → container or bare environment: honor whatever
+            # the platform injected (Render vars, compose env_file, shell).
+            return
         for key in _DOCKER_ENV_KEYS:
-            os.environ.pop(key, None)
+            value = os.environ.get(key)
+            if value and any(marker in value for marker in _CONTAINER_HOST_MARKERS):
+                os.environ.pop(key, None)
 
     app_env: str = "development"
     app_name: str = "MeetAI"
