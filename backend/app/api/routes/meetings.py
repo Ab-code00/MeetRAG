@@ -38,6 +38,19 @@ from app.services.storage import (
 router = APIRouter(prefix="/meetings", tags=["meetings"])
 
 
+def _upload_headers(content_type: str) -> dict[str, str]:
+    """Headers the browser must send with the presigned PUT.
+
+    SSE-S3 (``x-amz-server-side-encryption``) is a native-AWS-S3-only feature;
+    S3-compatible providers (Cloudflare R2, Backblaze B2) reject it, so it is
+    only requested when using native S3 (no custom endpoint).
+    """
+    headers = {"Content-Type": content_type}
+    if not get_settings().aws_endpoint_url:
+        headers["x-amz-server-side-encryption"] = "AES256"
+    return headers
+
+
 async def _tenant_meeting(db: DbSession, meeting_id: str, tenant_id: str) -> Meeting:
     meeting = await db.scalar(
         select(Meeting)
@@ -74,10 +87,7 @@ async def create_meeting(
                 upload_url=create_upload_url(
                     object_key=recording.object_key, content_type=recording.content_type
                 ),
-                upload_headers={
-                    "Content-Type": recording.content_type,
-                    "x-amz-server-side-encryption": "AES256",
-                },
+                upload_headers=_upload_headers(recording.content_type),
             )
     meeting = Meeting(
         tenant_id=auth.tenant_id,
@@ -127,10 +137,7 @@ async def create_meeting(
         upload_url = create_upload_url(
             object_key=recording.object_key, content_type=recording.content_type
         )
-        upload_headers = {
-            "Content-Type": recording.content_type,
-            "x-amz-server-side-encryption": "AES256",
-        }
+        upload_headers = _upload_headers(recording.content_type)
     except RuntimeError:
         # S3 not configured — frontend should use POST /meetings/{id}/upload instead
         upload_url = ""

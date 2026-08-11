@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import re
-from pathlib import Path
 from functools import lru_cache
+from pathlib import Path
 from typing import Any, cast
 
 import boto3
@@ -113,16 +113,22 @@ def create_upload_url(*, object_key: str, content_type: str, expires_seconds: in
             "when running in development mode."
         )
     settings = get_settings()
+    params: dict[str, Any] = {
+        "Bucket": settings.aws_s3_bucket,
+        "Key": object_key,
+        "ContentType": content_type,
+    }
+    if not settings.aws_endpoint_url:
+        # Native AWS S3 only: request SSE-S3 (x-amz-server-side-encryption).
+        # S3-compatible providers (Cloudflare R2, Backblaze B2, LocalStack)
+        # encrypt at rest themselves and may reject the SSE header on
+        # presigned PUTs.
+        params["ServerSideEncryption"] = "AES256"
     return cast(
         str,
         public_s3_client().generate_presigned_url(
             "put_object",
-            Params={
-                "Bucket": settings.aws_s3_bucket,
-                "Key": object_key,
-                "ContentType": content_type,
-                "ServerSideEncryption": "AES256",
-            },
+            Params=params,
             ExpiresIn=expires_seconds,
         ),
     )

@@ -13,6 +13,12 @@ COPY alembic ./alembic
 COPY alembic.ini ./
 RUN pip install --upgrade pip && pip install .
 
+# The local-storage fallback (used when S3 is not configured) must be writable
+# by the unprivileged meetai user. NOTE: Render's filesystem is ephemeral, so
+# recordings saved here are lost on redeploy/restart — durable uploads require
+# S3-compatible storage (AWS S3 / Cloudflare R2 / Backblaze B2).
+RUN mkdir -p /app/local_storage && chown -R meetai:meetai /app/local_storage
+
 USER meetai
 EXPOSE 8000
 # Migrations are idempotent (fresh-install safe), so running them at boot is

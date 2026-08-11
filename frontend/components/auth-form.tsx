@@ -10,6 +10,7 @@ export function AuthForm({ mode }: { mode: "login" | "register" }) {
   const router = useRouter();
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  const [slug, setSlug] = useState("");
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -38,7 +39,26 @@ export function AuthForm({ mode }: { mode: "login" | "register" }) {
         <form onSubmit={submit} className="form-stack">
           {register && <>
             <label>Organization name<input name="organization_name" required minLength={2} autoComplete="organization" /></label>
-            <label>Workspace slug<input name="organization_slug" required minLength={2} pattern="[a-z0-9-]+" placeholder="acme-team" /></label>
+            <label>Workspace slug
+              <input
+                name="organization_slug"
+                required
+                minLength={2}
+                pattern="[a-z0-9-]+"
+                title="Lowercase letters, numbers, and hyphens only — e.g. acme-team"
+                placeholder="acme-team"
+                autoComplete="off"
+                value={slug}
+                onChange={(event) =>
+                  setSlug(
+                    event.target.value
+                      .toLowerCase()
+                      .replace(/\s+/g, "-")
+                      .replace(/[^a-z0-9-]/g, ""),
+                  )
+                }
+              />
+            </label>
             <label>Your name<input name="name" required minLength={2} autoComplete="name" /></label>
           </>}
           {!register && <label>Workspace slug<input name="organization_slug" required autoComplete="organization" /></label>}
