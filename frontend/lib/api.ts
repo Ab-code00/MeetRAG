@@ -24,6 +24,34 @@ export class ApiError extends Error {
   }
 }
 
+/**
+ * FastAPI 422 responses return `detail` as an array of { loc, msg, type }
+ * objects. Turn any detail shape into a readable message instead of letting
+ * the raw array stringify to "[object Object]" in the UI.
+ */
+function errorMessage(body: unknown, fallback: string): string {
+  if (body && typeof body === "object") {
+    const detail = (body as { detail?: unknown }).detail;
+    if (typeof detail === "string") return detail;
+    if (Array.isArray(detail)) {
+      const parts = detail
+        .map((item) => {
+          if (item && typeof item === "object") {
+            const record = item as { loc?: unknown; msg?: unknown };
+            const field = Array.isArray(record.loc) ? String(record.loc[record.loc.length - 1]) : "";
+            const msg = typeof record.msg === "string" ? record.msg : "";
+            if (field && msg) return `${field}: ${msg}`;
+            return msg || String(item);
+          }
+          return String(item);
+        })
+        .filter(Boolean);
+      if (parts.length) return parts.join(" · ");
+    }
+  }
+  return fallback;
+}
+
 export const authStore = {
   get accessToken() {
     return typeof window === "undefined" ? null : sessionStorage.getItem("meetai_access");
@@ -59,7 +87,7 @@ export async function api<T>(path: string, init: RequestInit = {}, retry = true)
   if (response.status === 401 && retry && (await refreshAccess())) return api<T>(path, init, false);
   if (!response.ok) {
     const body = await response.json().catch(() => ({ detail: "Request failed" }));
-    throw new ApiError(response.status, body.detail ?? "Request failed");
+    throw new ApiError(response.status, errorMessage(body, "Request failed"));
   }
   if (response.status === 204) return undefined as T;
   return response.json() as Promise<T>;
@@ -77,7 +105,7 @@ export async function authenticate(
   });
   if (!response.ok) {
     const error = await response.json().catch(() => ({ detail: "Authentication failed" }));
-    throw new ApiError(response.status, error.detail);
+    throw new ApiError(response.status, errorMessage(error, "Authentication failed"));
   }
   authStore.set(await response.json());
 }
@@ -137,7 +165,7 @@ export async function streamChat(
     const error = await response
       .json()
       .catch(() => ({ detail: "Answer generation failed. Please try again." }));
-    handlers.onError(error.detail ?? "Answer generation failed. Please try again.");
+    handlers.onError(errorMessage(error, "Answer generation failed. Please try again."));
     return;
   }
   const reader = response.body.getReader();
